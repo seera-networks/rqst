@@ -96,7 +96,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             let mut local_addr = paths[0].local_addr;
             let peer_addr = paths[0].peer_addr;
 
-            conn.insert_group(local_addr, peer_addr, 1);
+            conn.insert_group(local_addr, peer_addr, 1).await.ok();
 
             local_addr.set_port(local_addr.port() + 1);
             match conn.probe_path(local_addr, peer_addr).await {
@@ -162,7 +162,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
                                 quiche::PathEvent::ReturnAvailable(local_addr, peer_addr) => {
                                     println!("Path ({}, {})'s return is now available", local_addr, peer_addr);
-                                    conn.insert_group(local_addr, peer_addr, 2);
+                                    conn.insert_group(local_addr, peer_addr, 2).await.ok();
                                 }
                                 
                                 quiche::PathEvent::FailedValidation(local_addr, peer_addr) => {
