@@ -95,6 +95,9 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             assert_eq!(paths.len(), 1);
             let mut local_addr = paths[0].local_addr;
             let peer_addr = paths[0].peer_addr;
+
+            conn.insert_group(local_addr, peer_addr, 1);
+
             local_addr.set_port(local_addr.port() + 1);
             match conn.probe_path(local_addr, peer_addr).await {
                 Ok(seq) => {
@@ -146,6 +149,50 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                     }
                 },
                 */
+                res = conn.path_event() => {
+                    match res {
+                        Ok(event) => {
+                            match event {
+                                quiche::PathEvent::New(..) => unreachable!(),
+
+                                quiche::PathEvent::Validated(local_addr, peer_addr) => {
+                                    println!("Path ({}, {}) is now validated", local_addr, peer_addr);
+                                    conn.set_active(local_addr, peer_addr, true).await.ok();
+                                }
+
+                                quiche::PathEvent::ReturnAvailable(local_addr, peer_addr) => {
+                                    println!("Path ({}, {})'s return is now available", local_addr, peer_addr);
+                                    conn.insert_group(local_addr, peer_addr, 2);
+                                }
+                                
+                                quiche::PathEvent::FailedValidation(local_addr, peer_addr) => {
+                                    println!("Path ({}, {}) failed validation", local_addr, peer_addr);
+                                }
+
+                                quiche::PathEvent::Closed(local_addr, peer_addr, e, reason) => {
+                                    println!("Path ({}, {}) is now closed and unusable; err = {}, reason = {:?}",
+                                        local_addr, peer_addr, e, reason);
+                                }
+
+                                quiche::PathEvent::ReusedSourceConnectionId(cid_seq, old, new) => {
+                                    println!("Peer reused cid seq {} (initially {:?}) on {:?}",
+                                        cid_seq, old, new);
+                                }
+
+                                quiche::PathEvent::PeerMigrated(..) => unreachable!(),
+
+                                quiche::PathEvent::PeerPathStatus(..) => {},
+
+                                quiche::PathEvent::InsertGroup(..) => unreachable!(),
+
+                                quiche::PathEvent::RemoveGroup(..) => unreachable!(),
+                            }
+                        }
+                        Err(e) => {
+                            println!("path_event failed: {:?}", e);
+                        }
+                    }
+                },
                 event = Pin::new(&mut ifwatcher) => {
                     println!("Got event {:?}", event);
                 },
