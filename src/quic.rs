@@ -257,8 +257,7 @@ impl QuicActor {
                 let scid = quiche::ConnectionId::from_ref(&scid).into_owned();
                 // Create a QUIC connection and initiate handshake.
                 let mut conn =
-                    quiche::connect(url.domain(), &scid, from, to, &mut self.config)
-                        .unwrap();
+                    quiche::connect(url.domain(), &scid, from, to, &mut self.config).unwrap();
 
                 if let Some(keylog) = &self.keylog {
                     if let Ok(keylog) = keylog.try_clone() {
@@ -268,7 +267,7 @@ impl QuicActor {
 
                 if let Some(dir) = std::env::var_os("QLOGDIR") {
                     let writer = make_qlog_writer(&dir, "client", &conn.trace_id());
-        
+
                     conn.set_qlog(
                         std::boxed::Box::new(writer),
                         "quiche-client qlog".to_string(),
@@ -313,7 +312,8 @@ impl QuicActor {
                             .push_back(RecvDgramReadnessRequest { respond_to });
                     }
                 } else {
-                    let _ = respond_to.send(Err(format!("No Connection: {:?}", conn_handle).into()));
+                    let _ =
+                        respond_to.send(Err(format!("No Connection: {:?}", conn_handle).into()));
                 }
             }
             ActorMessage::RecvDgram {
@@ -341,7 +341,8 @@ impl QuicActor {
                         let _ = respond_to.send(Ok(None));
                     }
                 } else {
-                    let _ = respond_to.send(Err(format!("No Connection: {:?}", conn_handle).into()));
+                    let _ =
+                        respond_to.send(Err(format!("No Connection: {:?}", conn_handle).into()));
                 }
             }
             ActorMessage::RecvDgramVectored {
@@ -369,7 +370,8 @@ impl QuicActor {
                     }
                     let _ = respond_to.send(Ok(bufs));
                 } else {
-                    let _ = respond_to.send(Err(format!("No Connection: {:?}", conn_handle).into()));
+                    let _ =
+                        respond_to.send(Err(format!("No Connection: {:?}", conn_handle).into()));
                 }
             }
             ActorMessage::RecvDgramInfo {
@@ -383,7 +385,8 @@ impl QuicActor {
 
                     let _ = respond_to.send(Ok((front_len, queue_byte_size, queue_len)));
                 } else {
-                    let _ = respond_to.send(Err(format!("No Connection: {:?}", conn_handle).into()));
+                    let _ =
+                        respond_to.send(Err(format!("No Connection: {:?}", conn_handle).into()));
                 }
             }
             ActorMessage::SendDgram {
@@ -406,7 +409,8 @@ impl QuicActor {
                         }
                     }
                 } else {
-                    let _ = respond_to.send(Err(format!("No Connection: {:?}", conn_handle).into()));
+                    let _ =
+                        respond_to.send(Err(format!("No Connection: {:?}", conn_handle).into()));
                 }
             }
             ActorMessage::Stats {
@@ -417,7 +421,8 @@ impl QuicActor {
                     let stats = conn.quiche_conn.stats();
                     let _ = respond_to.send(Ok(stats));
                 } else {
-                    let _ = respond_to.send(Err(format!("No Connection: {:?}", conn_handle).into()));
+                    let _ =
+                        respond_to.send(Err(format!("No Connection: {:?}", conn_handle).into()));
                 }
             }
             ActorMessage::PathStats {
@@ -425,7 +430,10 @@ impl QuicActor {
                 respond_to,
             } => {
                 if let Some(conn) = self.conns.get_mut(&conn_handle) {
-                    let stats = conn.quiche_conn.path_stats().collect::<Vec<quiche::PathStats>>();
+                    let stats = conn
+                        .quiche_conn
+                        .path_stats()
+                        .collect::<Vec<quiche::PathStats>>();
                     let _ = respond_to.send(Ok(stats));
                 } else {
                     let _ =
@@ -440,7 +448,8 @@ impl QuicActor {
                     conn.quiche_conn.close(true, 0x00, b"").ok();
                     let _ = respond_to.send(Ok(()));
                 } else {
-                    let _ = respond_to.send(Err(format!("No Connection: {:?}", conn_handle).into()));
+                    let _ =
+                        respond_to.send(Err(format!("No Connection: {:?}", conn_handle).into()));
                 }
             }
             ActorMessage::ProbePath {
@@ -449,13 +458,14 @@ impl QuicActor {
                 peer_addr,
                 respond_to,
             } => {
-                let socket_handle = self.addrs_to_sockets
+                let socket_handle = self
+                    .addrs_to_sockets
                     .iter()
                     .find(|(addr, handle)| {
-                        ((addr.is_ipv4() && local_addr.is_ipv4()) ||
-                            (addr.is_ipv6() && local_addr.is_ipv6())) &&
-                            (addr.ip().is_unspecified() || addr.ip() == local_addr.ip()) &&
-                            addr.port() == local_addr.port()
+                        ((addr.is_ipv4() && local_addr.is_ipv4())
+                            || (addr.is_ipv6() && local_addr.is_ipv6()))
+                            && (addr.ip().is_unspecified() || addr.ip() == local_addr.ip())
+                            && addr.port() == local_addr.port()
                     })
                     .map(|(_, handle)| *handle);
                 let socket_handle = if let Some(socket_handle) = socket_handle {
@@ -469,10 +479,11 @@ impl QuicActor {
                     match self.add_socket(local_addr).await {
                         Ok(v) => v,
                         Err(e) => {
-                            let _ = respond_to.send(Err(format!("get_binding failed: {:?}", e).into()));
+                            let _ =
+                                respond_to.send(Err(format!("get_binding failed: {:?}", e).into()));
                             return;
                         }
-                    }       
+                    }
                 };
                 let socket = self.sockets.get(&socket_handle).unwrap().clone();
 
@@ -485,14 +496,15 @@ impl QuicActor {
                                 let _ = respond_to.send(Ok(v));
                             }
                             Err(e) => {
-                                let _ = respond_to.send(Err(format!("probe_path failed: {:?}", e).into()));
+                                let _ = respond_to
+                                    .send(Err(format!("probe_path failed: {:?}", e).into()));
                             }
                         }
                     } else {
                         conn.probe_path_requests.push_back(ProbePathRequest {
                             local_addr,
                             peer_addr,
-                            respond_to
+                            respond_to,
                         });
                     }
                 } else {
@@ -569,7 +581,7 @@ impl QuicActor {
             );
             self.conn_ids.insert(new_dcid.clone(), new_conn_handle);
             self.next_conn_handle += 1;
-            
+
             new_conn_handle
         } else {
             *self.conn_ids.get(&hdr.dcid).unwrap()
@@ -650,30 +662,8 @@ impl QuicActor {
                 }
             }
 
-            for conn in self.conns.values_mut() {
-                loop {
-                    let (write, send_info) = match conn.quiche_conn.send(&mut self.out) {
-                        Ok(v) => v,
-                        Err(quiche::Error::Done) => {
-                            break;
-                        }
-                        Err(e) => {
-                            error!("{} send() failed: {:?}", conn.quiche_conn.trace_id(), e);
-                            conn.quiche_conn.close(false, 0x1, b"fail").ok();
-                            break;
-                        }
-                    };
-                    let socket = conn.locals_to_sockets.get(&send_info.from).unwrap();
-                    match send_sas(socket, &self.out[..write], &send_info.to, &send_info.from).await {
-                        Ok(written) => {
-                            trace!("{} written {} bytes", conn.quiche_conn.trace_id(), written);
-                        }
-                        Err(e) => {
-                            error!("{} send_to() failed: {:?}", conn.quiche_conn.trace_id(), e);
-                        }
-                    }
-                }
-                if !conn.send_dgram_requests.is_empty() {
+            for (conn_handle, conn) in self.conns.iter_mut() {
+                if conn.quiche_conn.is_established() {
                     while let Some(request) = conn.send_dgram_requests.pop_front() {
                         match conn.quiche_conn.dgram_send(&request.buf) {
                             Ok(_) => {
@@ -692,17 +682,65 @@ impl QuicActor {
                             }
                         }
                     }
+                    while conn.quiche_conn.source_cids_left() > 0 {
+                        let (new_scid, reset_token) =
+                            generate_cid_and_reset_token(self.conn_id_len);
+
+                        match conn
+                            .quiche_conn
+                            .new_source_cid(&new_scid, reset_token, false)
+                        {
+                            Ok(seq) => {
+                                info!("new_source_cid: {:?} {} {}", &new_scid, reset_token, seq);
+                            }
+                            Err(e) => {
+                                error!("Failed to new_source_cid: {:?}", e);
+                                break;
+                            }
+                        }
+                        self.conn_ids.insert(new_scid, *conn_handle);
+                    }
+                    if conn.quiche_conn.available_dcids() > 0 {
+                        while let Some(request) = conn.probe_path_requests.pop_front() {
+                            match conn
+                                .quiche_conn
+                                .probe_path(request.local_addr, request.peer_addr)
+                            {
+                                Ok(seq) => {
+                                    let _ = request.respond_to.send(Ok(seq));
+                                }
+                                Err(e) => {
+                                    let _ = request.respond_to.send(Err(format!(
+                                        "probe_path failed: {:?}",
+                                        e
+                                    )
+                                    .into()));
+                                }
+                            }
+                        }
+                    }
                 }
-                while conn.quiche_conn.source_cids_left() > 0 {
-                    let (new_scid, reset_token) = generate_cid_and_reset_token(self.conn_id_len);
-                    
-                    match conn.quiche_conn.new_source_cid(&new_scid, reset_token, false) {
-                        Ok(seq) => {
-                            info!("new_source_cid: {:?} {} {}", &new_scid, reset_token, seq);
+                loop {
+                    let (write, send_info) = match conn.quiche_conn.send(&mut self.out) {
+                        Ok(v) => v,
+                        Err(quiche::Error::Done) => {
+                            break;
                         }
                         Err(e) => {
-                            error!("Failed to new_source_cid: {:?}", e);
+                            error!("{} send() failed: {:?}", conn.quiche_conn.trace_id(), e);
+                            conn.quiche_conn.close(false, 0x1, b"fail").ok();
                             break;
+                        }
+                    };
+                    println!("from: {:?}", &send_info.from);
+                    let socket = conn.locals_to_sockets.get(&send_info.from).unwrap();
+                    match send_sas(socket, &self.out[..write], &send_info.to, &send_info.from).await
+                    {
+                        Ok(written) => {
+                            trace!("{} written {} bytes", conn.quiche_conn.trace_id(), written);
+                        }
+                        Err(e) => {
+                            error!("{} send_to() failed: {:?}", conn.quiche_conn.trace_id(), e);
                         }
                     }
                 }
@@ -942,7 +980,9 @@ impl QuicConnectionHandle {
 
 /// Makes a buffered writer for a qlog.
 pub fn make_qlog_writer(
-    dir: &std::ffi::OsStr, role: &str, id: &str,
+    dir: &std::ffi::OsStr,
+    role: &str,
+    id: &str,
 ) -> std::io::BufWriter<std::fs::File> {
     let mut path = std::path::PathBuf::from(dir);
     let filename = format!("{}-{}.sqlog", role, id);
