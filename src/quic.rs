@@ -95,6 +95,24 @@ enum ActorMessage {
         peer_addr: SocketAddr,
         respond_to: oneshot::Sender<Result<u64>>,
     },
+    PathEvent {
+        conn_handle: ConnectionHandle,
+        respond_to: oneshot::Sender<Result<quiche::PathEvent>>,
+    },
+    InsertGroup {
+        conn_handle: ConnectionHandle,
+        local_addr: SocketAddr,
+        peer_addr: SocketAddr,
+        group_id: u64,
+        respond_to: oneshot::Sender<Result<bool>>,
+    },
+    SetActive {
+        conn_handle: ConnectionHandle,
+        local_addr: SocketAddr,
+        peer_addr: SocketAddr,
+        is_active: bool,
+        respond_to: oneshot::Sender<Result<()>>,
+    }
 }
 
 struct QuicConnection {
@@ -105,6 +123,7 @@ struct QuicConnection {
     recv_dgram_readness_requests: VecDeque<RecvDgramReadnessRequest>,
     send_dgram_requests: VecDeque<SendDgramRequest>,
     probe_path_requests: VecDeque<ProbePathRequest>,
+    path_event_requests: VecDeque<PathEventRequest>,
 }
 type QuicConnectionIdMap = HashMap<quiche::ConnectionId<'static>, ConnectionHandle>;
 type QuicConnectionMap = HashMap<ConnectionHandle, QuicConnection>;
@@ -130,6 +149,10 @@ struct ProbePathRequest {
     local_addr: SocketAddr,
     peer_addr: SocketAddr,
     respond_to: oneshot::Sender<Result<u64>>,
+}
+
+struct PathEventRequest {
+    respond_to: oneshot::Sender<Result<quiche::PathEvent>>,
 }
 
 impl QuicActor {
@@ -295,6 +318,7 @@ impl QuicActor {
                         recv_dgram_readness_requests: VecDeque::new(),
                         send_dgram_requests: VecDeque::new(),
                         probe_path_requests: VecDeque::new(),
+                        path_event_requests: VecDeque::new(),
                     },
                 );
                 self.conn_ids.insert(scid, self.next_conn_handle);
@@ -511,6 +535,63 @@ impl QuicActor {
                     let _ =
                         respond_to.send(Err(format!("No Connection: {:?}", conn_handle).into()));
                 }
+            },
+            ActorMessage::PathEvent {
+                conn_handle,
+                respond_to,
+            } => {
+                if let Some(conn) = self.conns.get_mut(&conn_handle) {
+                    if let Some(event) = conn.quiche_conn.path_event_next() {
+                        let _ = respond_to.send(Ok(event));
+                    } else {
+                        conn.path_event_requests.push_back(PathEventRequest { respond_to });
+                    }
+                } else {
+                    let _ =
+                        respond_to.send(Err(format!("No Connection: {:?}", conn_handle).into()));
+                }
+            }
+            ActorMessage::InsertGroup {
+                conn_handle,
+                local_addr,
+                peer_addr,
+                group_id,
+                respond_to,
+            } => {
+                if let Some(conn) = self.conns.get_mut(&conn_handle) {
+                    match conn.quiche_conn.insert_group(local_addr, peer_addr, group_id) {
+                        Ok(v) => {
+                            let _ = respond_to.send(Ok(v));
+                        }
+                        Err(e) => {
+                           let _ = respond_to.send(Err(format!("failed to insert_group: {:?}", e).into()));
+                        }
+                    }
+                } else {
+                    let _ =
+                        respond_to.send(Err(format!("No Connection: {:?}", conn_handle).into()));
+                }
+            }
+            ActorMessage::SetActive {
+                conn_handle,
+                local_addr,
+                peer_addr,
+                is_active,
+                respond_to,
+            } => {
+                if let Some(conn) = self.conns.get_mut(&conn_handle) {
+                    match conn.quiche_conn.set_active(local_addr, peer_addr, is_active) {
+                        Ok(v) => {
+                            let _ = respond_to.send(Ok(v));
+                        }
+                        Err(e) => {
+                           let _ = respond_to.send(Err(format!("failed to set_active: {:?}", e).into()));
+                        }
+                    }
+                } else {
+                    let _ =
+                        respond_to.send(Err(format!("No Connection: {:?}", conn_handle).into()));
+                }
             }
         }
     }
@@ -577,6 +658,7 @@ impl QuicActor {
                     recv_dgram_readness_requests: VecDeque::new(),
                     send_dgram_requests: VecDeque::new(),
                     probe_path_requests: VecDeque::new(),
+                    path_event_requests: VecDeque::new(),
                 },
             );
             self.conn_ids.insert(new_dcid.clone(), new_conn_handle);
@@ -622,10 +704,6 @@ impl QuicActor {
                         let _ = request.respond_to.send(Ok(()));
                     }
                 }
-            }
-
-            while let Some(event) = conn.quiche_conn.path_event_next() {
-                info!("PathEvent: {:?}", event);
             }
         }
     }
@@ -719,6 +797,15 @@ impl QuicActor {
                             }
                         }
                     }
+                    while !conn.path_event_requests.is_empty() {
+                        if let Some(event) = conn.quiche_conn.path_event_next() {
+                            let event_request = conn.path_event_requests.pop_front().expect("empty");
+                            let _ = event_request.respond_to.send(Ok(event));
+                        } else {
+                            break;
+                        }
+                    }
+        
                 }
                 loop {
                     let (write, send_info) = match conn.quiche_conn.send(&mut self.out) {
@@ -961,6 +1048,42 @@ impl QuicConnectionHandle {
             conn_handle: self.conn_handle,
             local_addr,
             peer_addr,
+            respond_to: send,
+        };
+        let _ = self.sender.send(msg).await;
+        recv.await.expect("Actor task has been killed")
+    }
+
+    pub async fn path_event(&self) -> Result<quiche::PathEvent> {
+        let (send, recv) = oneshot::channel();
+        let msg = ActorMessage::PathEvent {
+            conn_handle: self.conn_handle,
+            respond_to: send,
+        };
+        let _ = self.sender.send(msg).await;
+        recv.await.expect("Actor task has been killed")
+    }
+
+    pub async fn insert_group(&self, local_addr: SocketAddr, peer_addr: SocketAddr, group_id: u64) -> Result<bool> {
+        let (send, recv) = oneshot::channel();
+        let msg = ActorMessage::InsertGroup {
+            conn_handle: self.conn_handle,
+            local_addr,
+            peer_addr,
+            group_id,
+            respond_to: send,
+        };
+        let _ = self.sender.send(msg).await;
+        recv.await.expect("Actor task has been killed")
+    }
+
+    pub async fn set_active(&self, local_addr: SocketAddr, peer_addr: SocketAddr, is_active: bool) -> Result<()> {
+        let (send, recv) = oneshot::channel();
+        let msg = ActorMessage::SetActive {
+            conn_handle: self.conn_handle,
+            local_addr,
+            peer_addr,
+            is_active,
             respond_to: send,
         };
         let _ = self.sender.send(msg).await;
