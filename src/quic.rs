@@ -75,6 +75,7 @@ enum ActorMessage {
     SendDgram {
         conn_handle: ConnectionHandle,
         buf: Bytes,
+        group_id: u64,
         respond_to: oneshot::Sender<Result<()>>,
     },
     Stats {
@@ -147,6 +148,7 @@ struct RecvDgramReadnessRequest {
 
 struct SendDgramRequest {
     buf: Bytes,
+    group_id: u64,
     respond_to: oneshot::Sender<Result<()>>,
 }
 
@@ -422,16 +424,17 @@ impl QuicActor {
             ActorMessage::SendDgram {
                 conn_handle,
                 buf,
+                group_id,
                 respond_to,
             } => {
                 if let Some(conn) = self.conns.get_mut(&conn_handle) {
-                    match conn.quiche_conn.dgram_send(&buf) {
+                    match conn.quiche_conn.dgram_send_group(&buf, group_id) {
                         Ok(_) => {
                             let _ = respond_to.send(Ok(()));
                         }
                         Err(e) if e == quiche::Error::Done => {
                             conn.send_dgram_requests
-                                .push_back(SendDgramRequest { buf, respond_to });
+                                .push_back(SendDgramRequest { buf, group_id, respond_to });
                         }
                         Err(e) => {
                             let _ =
@@ -772,7 +775,7 @@ impl QuicActor {
             for (conn_handle, conn) in self.conns.iter_mut() {
                 if conn.quiche_conn.is_established() {
                     while let Some(request) = conn.send_dgram_requests.pop_front() {
-                        match conn.quiche_conn.dgram_send(&request.buf) {
+                        match conn.quiche_conn.dgram_send_group(&request.buf, request.group_id) {
                             Ok(_) => {
                                 let _ = request.respond_to.send(Ok(()));
                             }
@@ -1041,11 +1044,12 @@ impl QuicConnectionHandle {
         recv.await.expect("Actor task has been killed")
     }
 
-    pub async fn send_dgram(&self, buf: &Bytes) -> Result<()> {
+    pub async fn send_dgram(&self, buf: &Bytes, group_id: u64) -> Result<()> {
         let (send, recv) = oneshot::channel();
         let msg = ActorMessage::SendDgram {
             conn_handle: self.conn_handle,
             buf: buf.clone(),
+            group_id,
             respond_to: send,
         };
         let _ = self.sender.send(msg).await;
@@ -1341,7 +1345,7 @@ mod tests {
         let conn1 = server.accept().await.unwrap();
 
         let buf = Bytes::from("hello");
-        conn.send_dgram(&buf).await.unwrap();
+        conn.send_dgram(&buf, 0).await.unwrap();
         let ret = conn1.recv_dgram().await;
         assert_eq!(ret.is_ok(), true);
         let buf1 = ret.unwrap();

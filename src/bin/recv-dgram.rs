@@ -31,6 +31,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     config.set_disable_active_migration(true);
     config.enable_early_data();
     config.enable_dgram(true, 1000, 1000);
+    config.set_multipath(true);
 
     let mut keylog = None;
 

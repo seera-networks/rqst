@@ -37,6 +37,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     config.set_disable_active_migration(true);
     config.enable_early_data();
     config.enable_dgram(true, 1000, 1000);
+    config.set_multipath(true);
 
     let mut keylog = None;
 
@@ -130,9 +131,28 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             buf.resize(1292, count);
             let buf = buf.freeze();
             tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                    let res = if count % 2 == 0 {
+                        conn.send_dgram(&buf, 1).await
+                    } else {
+                        conn.send_dgram(&buf, 2).await
+                    };
+                    match res {
+                        Ok(_) => {
+                            if let Some(new_count) = count.checked_add(1) {
+                                count = new_count;
+                            } else {
+                                count = 0;
+                            }
+                        }
+                        Err(e) => {
+                            println!("Send failed: {:?}", e);
+                            break;
+                        }
+                    }
+
+                }
                 /*
-                _ = sleep(Duration::from_nanos(0)) => {
-                    let res = quic.send_dgram(conn_id.clone(), &buf).await;
                 res = conn.send_dgram(&buf) => {
                     match res {
                         Ok(_) => {
