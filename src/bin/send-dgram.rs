@@ -117,7 +117,6 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                 /*
                 _ = sleep(Duration::from_nanos(0)) => {
                     let res = quic.send_dgram(conn_id.clone(), &buf).await;
-                */
                 res = conn.send_dgram(&buf) => {
                     match res {
                         Ok(_) => {
@@ -133,6 +132,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                 },
+                */
                 event = Pin::new(&mut ifwatcher) => {
                     println!("Got event {:?}", event);
                 },

@@ -25,6 +25,7 @@ struct QuicActor {
     receiver: mpsc::Receiver<ActorMessage>,
     next_socket_handle: SocketHandle,
     sockets: SocketMap,
+    addrs_to_sockets: HashMap<SocketAddr, SocketHandle>,
     recv_stream:
         StreamMap<usize, Pin<Box<dyn Stream<Item = (BytesMut, SocketAddr, SocketAddr)> + Send>>>,
     config: quiche::Config,
@@ -88,15 +89,22 @@ enum ActorMessage {
         conn_handle: ConnectionHandle,
         respond_to: oneshot::Sender<Result<Vec<quiche::PathStats>>>,
     },
+    ProbePath {
+        conn_handle: ConnectionHandle,
+        local_addr: SocketAddr,
+        peer_addr: SocketAddr,
+        respond_to: oneshot::Sender<Result<u64>>,
+    },
 }
 
 struct QuicConnection {
     quiche_conn: quiche::Connection,
-    socket: Arc<UdpSocket>,
+    locals_to_sockets: HashMap<SocketAddr, Arc<UdpSocket>>,
     before_established: bool,
     connect_request: Option<ConnectRequest>,
     recv_dgram_readness_requests: VecDeque<RecvDgramReadnessRequest>,
     send_dgram_requests: VecDeque<SendDgramRequest>,
+    probe_path_requests: VecDeque<ProbePathRequest>,
 }
 type QuicConnectionIdMap = HashMap<quiche::ConnectionId<'static>, ConnectionHandle>;
 type QuicConnectionMap = HashMap<ConnectionHandle, QuicConnection>;
@@ -118,6 +126,12 @@ struct SendDgramRequest {
     respond_to: oneshot::Sender<Result<()>>,
 }
 
+struct ProbePathRequest {
+    local_addr: SocketAddr,
+    peer_addr: SocketAddr,
+    respond_to: oneshot::Sender<Result<u64>>,
+}
+
 impl QuicActor {
     fn new(
         receiver: mpsc::Receiver<ActorMessage>,
@@ -131,6 +145,7 @@ impl QuicActor {
             receiver,
             next_socket_handle: 0,
             sockets: SocketMap::new(),
+            addrs_to_sockets: HashMap::new(),
             recv_stream: StreamMap::new(),
             config,
             keylog,
@@ -148,6 +163,12 @@ impl QuicActor {
     }
 
     async fn add_socket(&mut self, local: SocketAddr) -> std::io::Result<SocketHandle> {
+        if self.addrs_to_sockets.contains_key(&local) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AddrInUse,
+                "Already added",
+            ));
+        }
         let socket = bind_sas(&local).await?;
         let socket: socket2::Socket = socket.into_std().unwrap().into();
         socket.set_recv_buffer_size(0x7fffffff).unwrap();
@@ -156,6 +177,7 @@ impl QuicActor {
 
         let socket_handle = self.next_socket_handle;
         self.sockets.insert(socket_handle, socket.clone());
+        self.addrs_to_sockets.insert(local, socket_handle);
         self.next_socket_handle += 1;
 
         let stream = Box::pin(async_stream::stream! {
@@ -261,15 +283,19 @@ impl QuicActor {
                     .await
                     .unwrap();
 
+                let mut locals_to_sockets = HashMap::new();
+                locals_to_sockets.insert(send_info.from, socket.clone());
+
                 self.conns.insert(
                     self.next_conn_handle,
                     QuicConnection {
                         quiche_conn: conn,
-                        socket: socket.clone(),
+                        locals_to_sockets,
                         before_established: true,
                         connect_request: Some(ConnectRequest { respond_to }),
                         recv_dgram_readness_requests: VecDeque::new(),
                         send_dgram_requests: VecDeque::new(),
+                        probe_path_requests: VecDeque::new(),
                     },
                 );
                 self.conn_ids.insert(scid, self.next_conn_handle);
@@ -417,6 +443,63 @@ impl QuicActor {
                     let _ = respond_to.send(Err(format!("No Connection: {:?}", conn_handle).into()));
                 }
             }
+            ActorMessage::ProbePath {
+                conn_handle,
+                local_addr,
+                peer_addr,
+                respond_to,
+            } => {
+                let socket_handle = self.addrs_to_sockets
+                    .iter()
+                    .find(|(addr, handle)| {
+                        ((addr.is_ipv4() && local_addr.is_ipv4()) ||
+                            (addr.is_ipv6() && local_addr.is_ipv6())) &&
+                            (addr.ip().is_unspecified() || addr.ip() == local_addr.ip()) &&
+                            addr.port() == local_addr.port()
+                    })
+                    .map(|(_, handle)| *handle);
+                let socket_handle = if let Some(socket_handle) = socket_handle {
+                    socket_handle
+                } else {
+                    let local_addr = if local_addr.is_ipv4() {
+                        SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), local_addr.port())
+                    } else {
+                        SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), local_addr.port())
+                    };
+                    match self.add_socket(local_addr).await {
+                        Ok(v) => v,
+                        Err(e) => {
+                            let _ = respond_to.send(Err(format!("get_binding failed: {:?}", e).into()));
+                            return;
+                        }
+                    }       
+                };
+                let socket = self.sockets.get(&socket_handle).unwrap().clone();
+
+                if let Some(conn) = self.conns.get_mut(&conn_handle) {
+                    conn.locals_to_sockets.insert(local_addr, socket);
+
+                    if conn.quiche_conn.available_dcids() > 0 {
+                        match conn.quiche_conn.probe_path(local_addr, peer_addr) {
+                            Ok(v) => {
+                                let _ = respond_to.send(Ok(v));
+                            }
+                            Err(e) => {
+                                let _ = respond_to.send(Err(format!("probe_path failed: {:?}", e).into()));
+                            }
+                        }
+                    } else {
+                        conn.probe_path_requests.push_back(ProbePathRequest {
+                            local_addr,
+                            peer_addr,
+                            respond_to
+                        });
+                    }
+                } else {
+                    let _ =
+                        respond_to.send(Err(format!("No Connection: {:?}", conn_handle).into()));
+                }
+            }
         }
     }
 
@@ -449,7 +532,7 @@ impl QuicActor {
             let new_dcid = quiche::ConnectionId::from_vec(new_dcid.into());
 
             let mut conn =
-                quiche::accept(&new_dcid, None, to, from, &mut self.config).unwrap();
+                quiche::accept(&new_dcid, None, to.clone(), from, &mut self.config).unwrap();
 
             if let Some(keylog) = &mut self.keylog {
                 if let Ok(keylog) = keylog.try_clone() {
@@ -468,17 +551,20 @@ impl QuicActor {
             }
 
             let socket = self.sockets.get(&handle).unwrap();
+            let mut locals_to_sockets = HashMap::new();
+            locals_to_sockets.insert(to, socket.clone());
             let new_conn_handle = self.next_conn_handle;
 
             self.conns.insert(
                 new_conn_handle,
                 QuicConnection {
                     quiche_conn: conn,
-                    socket: socket.clone(),
+                    locals_to_sockets,
                     before_established: true,
                     connect_request: None,
                     recv_dgram_readness_requests: VecDeque::new(),
                     send_dgram_requests: VecDeque::new(),
+                    probe_path_requests: VecDeque::new(),
                 },
             );
             self.conn_ids.insert(new_dcid.clone(), new_conn_handle);
@@ -526,20 +612,6 @@ impl QuicActor {
                 }
             }
 
-            while conn.quiche_conn.source_cids_left() > 0 {
-                let mut scid = [0; quiche::MAX_CONN_ID_LEN];
-                let scid = &mut scid[0..self.conn_id_len];
-                SystemRandom::new().fill(&mut scid[..]).unwrap();
-                let scid = quiche::ConnectionId::from_vec(scid.into());
-                let mut reset_token = [0; 16];
-                SystemRandom::new().fill(&mut reset_token).unwrap();
-                let reset_token = u128::from_be_bytes(reset_token);
-
-                info!("new_source_cid: {:?} {}", &scid, reset_token);
-                if conn.quiche_conn.new_source_cid(&scid, reset_token, false).is_err() {
-                    break;
-                }
-            }
             while let Some(event) = conn.quiche_conn.path_event_next() {
                 info!("PathEvent: {:?}", event);
             }
@@ -591,7 +663,8 @@ impl QuicActor {
                             break;
                         }
                     };
-                    match send_sas(&conn.socket, &self.out[..write], &send_info.to, &send_info.from).await {
+                    let socket = conn.locals_to_sockets.get(&send_info.from).unwrap();
+                    match send_sas(socket, &self.out[..write], &send_info.to, &send_info.from).await {
                         Ok(written) => {
                             trace!("{} written {} bytes", conn.quiche_conn.trace_id(), written);
                         }
@@ -620,8 +693,18 @@ impl QuicActor {
                         }
                     }
                 }
-                while let Some(event) = conn.quiche_conn.path_event_next() {
-                    info!("event: {:?}", event);
+                while conn.quiche_conn.source_cids_left() > 0 {
+                    let (new_scid, reset_token) = generate_cid_and_reset_token(self.conn_id_len);
+                    
+                    match conn.quiche_conn.new_source_cid(&new_scid, reset_token, false) {
+                        Ok(seq) => {
+                            info!("new_source_cid: {:?} {} {}", &new_scid, reset_token, seq);
+                        }
+                        Err(e) => {
+                            error!("Failed to new_source_cid: {:?}", e);
+                            break;
+                        }
+                    }
                 }
             }
             self.conns.retain(|_, ref mut c| !c.quiche_conn.is_closed());
@@ -834,6 +917,18 @@ impl QuicConnectionHandle {
         recv.await.expect("Actor task has been killed")
     }
 
+    pub async fn probe_path(&self, local_addr: SocketAddr, peer_addr: SocketAddr) -> Result<u64> {
+        let (send, recv) = oneshot::channel();
+        let msg = ActorMessage::ProbePath {
+            conn_handle: self.conn_handle,
+            local_addr,
+            peer_addr,
+            respond_to: send,
+        };
+        let _ = self.sender.send(msg).await;
+        recv.await.expect("Actor task has been killed")
+    }
+
     pub async fn close(&self) -> Result<()> {
         let (send, recv) = oneshot::channel();
         let msg = ActorMessage::Close {
@@ -861,6 +956,16 @@ pub fn make_qlog_writer(
             path, e
         ),
     }
+}
+
+fn generate_cid_and_reset_token(conn_id_len: usize) -> (quiche::ConnectionId<'static>, u128) {
+    let mut scid = vec![0; conn_id_len];
+    SystemRandom::new().fill(&mut scid[..]).unwrap();
+    let scid = quiche::ConnectionId::from_vec(scid);
+    let mut reset_token = [0; 16];
+    SystemRandom::new().fill(&mut reset_token).unwrap();
+    let reset_token = u128::from_be_bytes(reset_token);
+    (scid, reset_token)
 }
 
 pub mod testing {
