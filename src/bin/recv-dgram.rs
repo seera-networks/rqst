@@ -57,9 +57,9 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         shutdown_complete_tx.clone(),
     );
 
-    let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 4567);
+    let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 4433);
     quic.listen(local).await.unwrap();
-    let local = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 4567);
+    let local = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 4433);
     quic.listen(local).await.unwrap();
 
     loop {
