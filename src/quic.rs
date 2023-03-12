@@ -1,5 +1,5 @@
 use bytes::{Bytes, BytesMut};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{btree_map, BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::pin::Pin;
@@ -55,6 +55,16 @@ enum ActorMessage {
         url: url::Url,
         respond_to: oneshot::Sender<Result<ConnectionHandle>>,
     },
+    RecvStreamReadness {
+        conn_handle: ConnectionHandle,
+        stream_ids: Option<Vec<u64>>,
+        respond_to: oneshot::Sender<Result<Vec<u64>>>,
+    },
+    RecvStream {
+        conn_handle: ConnectionHandle,
+        stream_id: u64,
+        respond_to: oneshot::Sender<Result<Option<(Bytes, bool)>>>,
+    },
     RecvDgramReadness {
         conn_handle: ConnectionHandle,
         respond_to: oneshot::Sender<Result<()>>,
@@ -71,6 +81,13 @@ enum ActorMessage {
     RecvDgramInfo {
         conn_handle: ConnectionHandle,
         respond_to: oneshot::Sender<Result<(Option<usize>, usize, usize)>>,
+    },
+    SendStream {
+        conn_handle: ConnectionHandle,
+        buf: Bytes,
+        stream_id: u64,
+        fin: bool,
+        respond_to: oneshot::Sender<Result<()>>,
     },
     SendDgram {
         conn_handle: ConnectionHandle,
@@ -125,6 +142,8 @@ struct QuicConnection {
     locals_to_sockets: HashMap<SocketAddr, Arc<UdpSocket>>,
     before_established: bool,
     connect_request: Option<ConnectRequest>,
+    recv_stream_readness_requests: VecDeque<RecvStreamReadnessRequest>,
+    send_stream_requests: BTreeMap<u64, VecDeque<SendStreamRequest>>,
     recv_dgram_readness_requests: VecDeque<RecvDgramReadnessRequest>,
     send_dgram_requests: VecDeque<SendDgramRequest>,
     probe_path_requests: VecDeque<ProbePathRequest>,
@@ -149,6 +168,17 @@ struct RecvDgramReadnessRequest {
 struct SendDgramRequest {
     buf: Bytes,
     group_id: u64,
+    respond_to: oneshot::Sender<Result<()>>,
+}
+
+struct RecvStreamReadnessRequest {
+    stream_ids: Option<Vec<u64>>,
+    respond_to: oneshot::Sender<Result<Vec<u64>>>,
+}
+
+struct SendStreamRequest {
+    buf: Bytes,
+    fin: bool,
     respond_to: oneshot::Sender<Result<()>>,
 }
 
@@ -322,6 +352,8 @@ impl QuicActor {
                         locals_to_sockets,
                         before_established: true,
                         connect_request: Some(ConnectRequest { respond_to }),
+                        recv_stream_readness_requests: VecDeque::new(),
+                        send_stream_requests: BTreeMap::new(),
                         recv_dgram_readness_requests: VecDeque::new(),
                         send_dgram_requests: VecDeque::new(),
                         probe_path_requests: VecDeque::new(),
@@ -331,6 +363,58 @@ impl QuicActor {
                 );
                 self.conn_ids.insert(scid, self.next_conn_handle);
                 self.next_conn_handle += 1;
+            }
+            ActorMessage::RecvStreamReadness {
+                conn_handle,
+                stream_ids, 
+                respond_to,
+            } => {
+                if let Some(conn) = self.conns.get_mut(&conn_handle) {
+                    let readable = if let Some(stream_ids) = &stream_ids {
+                        let stream_ids = stream_ids.iter().cloned().collect::<HashSet<u64>>();
+                        let readable = conn.quiche_conn.readable().collect::<HashSet<u64>>();
+                        stream_ids.intersection(&readable).cloned().collect::<Vec<u64>>()
+                    } else {
+                        conn.quiche_conn.readable().collect::<Vec<u64>>()
+                    };
+                    if !readable.is_empty() {
+                        respond_to.send(Ok(readable)).ok();
+                    } else {
+                        conn.recv_stream_readness_requests
+                            .push_back(RecvStreamReadnessRequest { stream_ids, respond_to });
+                    }
+                } else {
+                    respond_to
+                        .send(Err(format!("No Connection: {:?}", conn_handle).into()))
+                        .ok();
+                }
+            }
+            ActorMessage::RecvStream {
+                conn_handle,
+                stream_id,
+                respond_to,
+            } => {
+                if let Some(conn) = self.conns.get_mut(&conn_handle) {
+                    let mut buf = BytesMut::with_capacity(4096);
+                    buf.resize(4096, 0);
+                    match conn.quiche_conn.stream_recv(stream_id, &mut buf) {
+                        Ok((read, fin)) => {
+                            buf.truncate(read);
+                            respond_to.send(Ok(Some((buf.freeze(), fin)))).ok();
+                        }
+                        Err(e) if e == quiche::Error::Done => {
+                            respond_to.send(Ok(None)).ok();
+                        }
+                        Err(e) => {
+                            respond_to
+                                .send(Err(format!("stream_recv failed: {:?}", e).into()))
+                                .ok();
+                        }
+                    }
+                } else {
+                    let _ =
+                        respond_to.send(Err(format!("No Connection: {:?}", conn_handle).into()));
+                }
             }
             ActorMessage::RecvDgramReadness {
                 conn_handle,
@@ -421,6 +505,52 @@ impl QuicActor {
                         respond_to.send(Err(format!("No Connection: {:?}", conn_handle).into()));
                 }
             }
+            ActorMessage::SendStream {
+                conn_handle,
+                mut buf,
+                stream_id,
+                fin,
+                respond_to,
+            } => {
+                if let Some(conn) = self.conns.get_mut(&conn_handle) {
+                    match conn.quiche_conn.stream_send(stream_id, &buf, fin) {
+                        Ok(written) => {
+                            if written < buf.len() {
+                                let buf = buf.split_off(written);
+                                conn.send_stream_requests
+                                    .entry(stream_id)
+                                    .or_insert_with(|| VecDeque::new())
+                                    .push_back(SendStreamRequest {
+                                        buf,
+                                        fin,
+                                        respond_to,
+                                    });
+                            } else {
+                                respond_to.send(Ok(())).ok();
+                            }
+                        }
+                        Err(e) if e == quiche::Error::Done => {
+                            conn.send_stream_requests
+                                .entry(stream_id)
+                                .or_insert_with(|| VecDeque::new())
+                                .push_back(SendStreamRequest {
+                                    buf,
+                                    fin,
+                                    respond_to,
+                                });
+                        }
+                        Err(e) => {
+                            respond_to
+                                .send(Err(format!("dgram_send failed: {:?}", e).into()))
+                                .ok();
+                        }
+                    }
+                } else {
+                    respond_to
+                        .send(Err(format!("No Connection: {:?}", conn_handle).into()))
+                        .ok();
+                }
+            }
             ActorMessage::SendDgram {
                 conn_handle,
                 buf,
@@ -433,8 +563,11 @@ impl QuicActor {
                             let _ = respond_to.send(Ok(()));
                         }
                         Err(e) if e == quiche::Error::Done => {
-                            conn.send_dgram_requests
-                                .push_back(SendDgramRequest { buf, group_id, respond_to });
+                            conn.send_dgram_requests.push_back(SendDgramRequest {
+                                buf,
+                                group_id,
+                                respond_to,
+                            });
                         }
                         Err(e) => {
                             let _ =
@@ -494,7 +627,7 @@ impl QuicActor {
                 let socket_handle = self
                     .addrs_to_sockets
                     .iter()
-                    .find(|(addr, handle)| {
+                    .find(|(addr, _)| {
                         ((addr.is_ipv4() && local_addr.is_ipv4())
                             || (addr.is_ipv6() && local_addr.is_ipv6()))
                             && (addr.ip().is_unspecified() || addr.ip() == local_addr.ip())
@@ -686,6 +819,8 @@ impl QuicActor {
                     locals_to_sockets,
                     before_established: true,
                     connect_request: None,
+                    recv_stream_readness_requests: VecDeque::new(),
+                    send_stream_requests: BTreeMap::new(),
                     recv_dgram_readness_requests: VecDeque::new(),
                     send_dgram_requests: VecDeque::new(),
                     probe_path_requests: VecDeque::new(),
@@ -728,9 +863,26 @@ impl QuicActor {
                     }
                     conn.before_established = false;
                 }
-            }
 
-            if conn.quiche_conn.is_established() {
+                if !conn.recv_stream_readness_requests.is_empty() &&
+                    conn.quiche_conn.readable().next().is_some()
+                {
+                    while let Some(request) = conn.recv_stream_readness_requests.pop_front() {
+                        let readable = if let Some(stream_ids) = &request.stream_ids {
+                            let stream_ids = stream_ids.iter().cloned().collect::<HashSet<u64>>();
+                            let readable = conn.quiche_conn.readable().collect::<HashSet<u64>>();
+                            stream_ids.intersection(&readable).cloned().collect::<Vec<u64>>()
+                        } else {
+                            conn.quiche_conn.readable().collect::<Vec<u64>>()
+                        };
+                        if !readable.is_empty() {
+                            request.respond_to.send(Ok(readable)).ok();
+                        } else {
+                            conn.recv_stream_readness_requests.push_front(request);
+                            break;
+                        }
+                    }
+                }
                 if conn.quiche_conn.dgram_recv_queue_len() > 0 {
                     while let Some(request) = conn.recv_dgram_readness_requests.pop_front() {
                         let _ = request.respond_to.send(Ok(()));
@@ -774,8 +926,62 @@ impl QuicActor {
 
             for (conn_handle, conn) in self.conns.iter_mut() {
                 if conn.quiche_conn.is_established() {
+                    if !conn.send_stream_requests.is_empty() {
+                        let queued = conn
+                            .send_stream_requests
+                            .iter()
+                            .map(|(id, _)| *id)
+                            .collect::<HashSet<u64>>();
+                        let writable = conn.quiche_conn.writable().collect::<HashSet<u64>>();
+                        for stream_id in queued.intersection(&writable) {
+                            if let btree_map::Entry::Occupied(mut entry) =
+                                conn.send_stream_requests.entry(*stream_id)
+                            {
+                                let queue = entry.get_mut();
+                                while let Some(mut request) = queue.pop_front() {
+                                    match conn.quiche_conn.stream_send(
+                                        *stream_id,
+                                        &mut request.buf,
+                                        request.fin,
+                                    ) {
+                                        Ok(written) => {
+                                            if written < request.buf.len() {
+                                                let buf = request.buf.split_off(written);
+                                                queue.push_front(SendStreamRequest {
+                                                    buf,
+                                                    fin: request.fin,
+                                                    respond_to: request.respond_to,
+                                                });
+                                                break;
+                                            } else {
+                                                request.respond_to.send(Ok(())).ok();
+                                            }
+                                        }
+                                        Err(e) if e == quiche::Error::Done => {
+                                            queue.push_front(request);
+                                            break;
+                                        }
+                                        Err(e) => {
+                                            request
+                                                .respond_to
+                                                .send(Err(
+                                                    format!("stream_send failed: {:?}", e).into()
+                                                ))
+                                                .ok();
+                                        }
+                                    }
+                                }
+                                if queue.is_empty() {
+                                    entry.remove();
+                                }
+                            }
+                        }
+                    }
                     while let Some(request) = conn.send_dgram_requests.pop_front() {
-                        match conn.quiche_conn.dgram_send_group(&request.buf, request.group_id) {
+                        match conn
+                            .quiche_conn
+                            .dgram_send_group(&request.buf, request.group_id)
+                        {
                             Ok(_) => {
                                 let _ = request.respond_to.send(Ok(()));
                             }
@@ -837,7 +1043,6 @@ impl QuicActor {
                             request.respond_to.send(Ok(())).ok();
                         }
                     }
-
                 }
 
                 loop {
@@ -967,6 +1172,47 @@ pub struct QuicConnectionHandle {
 }
 
 impl QuicConnectionHandle {
+    pub async fn recv_stream_ready(&self, stream_ids: Option<Vec<u64>>) -> Result<Vec<u64>> {
+        let (send, recv) = oneshot::channel();
+        let msg = ActorMessage::RecvStreamReadness {
+            conn_handle: self.conn_handle,
+            stream_ids,
+            respond_to: send,
+        };
+        let _ = self.sender.send(msg).await;
+        recv.await.expect("Actor task has been killed")
+    }
+
+    pub async fn recv_stream(&self, stream_id: u64) -> Result<Option<(Bytes, bool)>> {
+        loop {
+            let (send, recv) = oneshot::channel();
+            let msg = ActorMessage::RecvStream {
+                conn_handle: self.conn_handle,
+                stream_id,
+                respond_to: send,
+            };
+            let _ = self.sender.send(msg).await;
+            match recv.await.expect("Actor task has been killed") {
+                Ok(Some(buf)) => {
+                    return Ok(Some(buf));
+                }
+                Ok(None) => {
+                    let (send, recv) = oneshot::channel();
+                    let msg = ActorMessage::RecvStreamReadness {
+                        conn_handle: self.conn_handle,
+                        stream_ids: Some(vec![stream_id]),
+                        respond_to: send,
+                    };
+                    let _ = self.sender.send(msg).await;
+                    let _ = recv.await.expect("Actor task has been killed");
+                }
+                Err(e) => {
+                    return Err(e);
+                }
+            }
+        }
+    }
+
     pub async fn recv_dgram_ready(&self) -> Result<()> {
         let (send, recv) = oneshot::channel();
         let msg = ActorMessage::RecvDgramReadness {
@@ -1038,6 +1284,19 @@ impl QuicConnectionHandle {
         let (send, recv) = oneshot::channel();
         let msg = ActorMessage::RecvDgramInfo {
             conn_handle: self.conn_handle,
+            respond_to: send,
+        };
+        let _ = self.sender.send(msg).await;
+        recv.await.expect("Actor task has been killed")
+    }
+
+    pub async fn send_stream(&self, buf: &Bytes, stream_id: u64, fin: bool) -> Result<()> {
+        let (send, recv) = oneshot::channel();
+        let msg = ActorMessage::SendStream {
+            conn_handle: self.conn_handle,
+            buf: buf.clone(),
+            stream_id,
+            fin,
             respond_to: send,
         };
         let _ = self.sender.send(msg).await;
@@ -1329,6 +1588,35 @@ mod tests {
         let _ = client.connect(url).await;
         let ret = server.accept().await;
         assert_eq!(ret.is_ok(), true);
+    }
+
+    #[tokio::test]
+    async fn stream() {
+        let (shutdown_complete_tx, _) = mpsc::channel(1);
+        let server = testing::open_server(12349, shutdown_complete_tx.clone())
+            .await
+            .unwrap();
+        let client = testing::open_client(shutdown_complete_tx.clone())
+            .await
+            .unwrap();
+        let url = url::Url::parse("http://127.0.0.1:12349").unwrap();
+        let conn = client.connect(url).await.unwrap();
+        let conn1 = server.accept().await.unwrap();
+
+        let buf = Bytes::from("hello");
+        let ret = conn.send_stream(&buf, 0, true).await;
+        assert_eq!(ret.is_ok(), true);
+        let ret = conn1.recv_stream_ready(None).await;
+        assert_eq!(ret.is_ok(), true);
+        let readable = ret.unwrap();
+        assert_eq!(readable, vec![0]);
+        let ret = conn1.recv_stream(0).await;
+        assert_eq!(ret.is_ok(), true);
+        let ret = ret.unwrap();
+        assert_eq!(ret.is_some(), true);
+        let (buf1, fin) = ret.unwrap();
+        assert_eq!(buf, buf1);
+        assert_eq!(fin, true);
     }
 
     #[tokio::test]

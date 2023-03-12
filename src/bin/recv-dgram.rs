@@ -118,7 +118,6 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             
                                             quiche::PathEvent::ReturnAvailable(local_addr, peer_addr) => {
                                                 println!("Path ({}, {})'s return is now available", local_addr, peer_addr);
-                                                conn.insert_group(local_addr, peer_addr, 2);
                                             }
                                             
                                             quiche::PathEvent::FailedValidation(local_addr, peer_addr) => {
