@@ -1,18 +1,55 @@
+use anyhow::{anyhow, Context};
 use flexi_logger::{detailed_format, FileSpec, Logger, WriteMode};
-use log::info;
+use log::{info, error};
 use rqst::quic::*;
 use rqst::vpn;
 use tokio::sync::{broadcast, mpsc};
+use std::path::PathBuf;
 use std::net::{SocketAddr, IpAddr, Ipv4Addr, Ipv6Addr};
 
-fn main() {
+fn main() -> anyhow::Result<()> {
+    let cert_default_path = std::env::current_exe()
+        .unwrap()
+        .with_file_name("server.crt");
+    let key_default_path = std::env::current_exe()
+        .unwrap()
+        .with_file_name("server.key");
+    let log_default_path = FileSpec::default()
+        .directory(
+            std::env::current_exe()
+            .unwrap()
+            .parent()
+            .unwrap()
+        ).as_pathbuf(None);
+
     let app = clap::command!()
         .propagate_version(true)
         .subcommand_required(false)
         .arg_required_else_help(false)
         .arg(clap::arg!(-d - -disable_verify).help("Disable to verify the client certificate"))
         .arg(clap::arg!(-v - -verbose).help("Print logs to Stderr"))
-        .arg(clap::arg!(-p - -pktlog).help("Write packets to a pcap file"));
+        .arg(clap::arg!(-p - -pktlog).help("Write packets to a pcap file"))
+        .arg(
+            clap::arg!(--cert <file>)
+                .required(false)
+                .value_parser(clap::value_parser!(PathBuf))
+                .default_value(cert_default_path.to_str().unwrap())
+                .help("TLS certificate path")
+        )
+        .arg(
+            clap::arg!(--key <file>)
+                .required(false)
+                .value_parser(clap::value_parser!(PathBuf))
+                .default_value(key_default_path.to_str().unwrap())
+                .help("TLS key path")
+        )
+        .arg(
+            clap::arg!(--log <file>)
+                .required(false)
+                .value_parser(clap::value_parser!(PathBuf))
+                .default_value(log_default_path.to_str().unwrap())
+                .help("log path")
+        );
 
     #[cfg(windows)]
     let app = app
@@ -22,6 +59,22 @@ fn main() {
             clap::Command::new("run_as_service").about("Work as service (Not used manually!)"),
         );
     let matches = app.get_matches();
+
+    let mut log_path = std::env::current_dir().unwrap();
+    log_path.push(
+        matches.get_one::<PathBuf>("log")
+            .ok_or(anyhow!("log not provided"))?
+    );
+
+    let logger = Logger::try_with_env_or_str("info")?
+        .write_mode(WriteMode::BufferAndFlush)
+        .format(detailed_format);
+    let logger = if matches.is_present("verbose") {
+        logger.log_to_stderr()
+    } else {
+        logger.log_to_file(FileSpec::try_from(log_path)?)
+    };
+    let _logger_handle = logger.start()?;
 
     match matches.subcommand() {
         #[cfg(windows)]
@@ -47,16 +100,18 @@ fn main() {
             .build()
             .unwrap()
             .block_on(async {
-                let _ = tokio_main(
+                if let Err(e) = tokio_main(
                     None,
                     matches.is_present("disable_verify"),
-                    matches.is_present("verbose"),
                     matches.is_present("pktlog"),
-                )
-                .await;
+                ).await
+                {
+                    error!("{:?}", e);
+                };
             }),
         _ => {}
     }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -184,27 +239,14 @@ mod vpn_server_service {
 async fn tokio_main(
     notify_stop: Option<mpsc::Receiver<()>>,
     disable_verify: bool,
-    verbose: bool,
     enable_pktlog: bool,
-) -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let current_exe = std::env::current_exe().unwrap();
-    let logger = Logger::try_with_env_or_str("info")?
-        .write_mode(WriteMode::BufferAndFlush)
-        .format(detailed_format);
-    let logger = if verbose {
-        logger.log_to_stderr()
-    } else {
-        logger.log_to_file(FileSpec::default().directory(current_exe.parent().unwrap()))
-    };
-    let _logger_handle = logger.start()?;
-
+) -> anyhow::Result<()> {
     let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
 
     if !disable_verify {
         let ca_crt_path = std::env::current_exe().unwrap().with_file_name("ca.crt");
         config
-            .load_verify_locations_from_file(ca_crt_path.to_str().unwrap())
-            .unwrap();
+            .load_verify_locations_from_file(ca_crt_path.to_str().unwrap())?;
         config.verify_peer(true);
     }
 
@@ -215,13 +257,11 @@ async fn tokio_main(
         .unwrap()
         .with_file_name("server.key");
     config
-        .load_cert_chain_from_pem_file(crt_path.to_str().unwrap())
-        .unwrap();
+        .load_cert_chain_from_pem_file(crt_path.to_str().unwrap())?;
     config
-        .load_priv_key_from_pem_file(key_path.to_str().unwrap())
-        .unwrap();
+        .load_priv_key_from_pem_file(key_path.to_str().unwrap())?;
 
-    config.set_application_protos(&[b"vpn"]).unwrap();
+    config.set_application_protos(&[b"vpn"])?;
 
     config.set_max_idle_timeout(0);
     config.set_max_recv_udp_payload_size(1350);
