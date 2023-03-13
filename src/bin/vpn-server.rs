@@ -310,6 +310,7 @@ async fn tokio_main(
     config.set_disable_active_migration(true);
     config.enable_early_data();
     config.enable_dgram(true, 1000, 1000);
+    config.set_multipath(true);
 
     let mut keylog = None;
 

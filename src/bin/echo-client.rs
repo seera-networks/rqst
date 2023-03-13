@@ -195,26 +195,26 @@ async fn main() -> anyhow::Result<()> {
                     quiche::PathEvent::New(..) => unreachable!(),
 
                     quiche::PathEvent::Validated(local_addr, peer_addr) => {
-                        println!("Path ({}, {}) is now validated", local_addr, peer_addr);
+                        info!("Path ({}, {}) is now validated", local_addr, peer_addr);
                         conn.set_active(local_addr, peer_addr, true).await.ok();
                     }
 
                     quiche::PathEvent::ReturnAvailable(local_addr, peer_addr) => {
-                        println!("Path ({}, {})'s return is now available", local_addr, peer_addr);
+                        info!("Path ({}, {})'s return is now available", local_addr, peer_addr);
                         conn.insert_group(local_addr, peer_addr, 2).await.ok();
                     }
 
                     quiche::PathEvent::FailedValidation(local_addr, peer_addr) => {
-                        println!("Path ({}, {}) failed validation", local_addr, peer_addr);
+                        info!("Path ({}, {}) failed validation", local_addr, peer_addr);
                     }
 
                     quiche::PathEvent::Closed(local_addr, peer_addr, e, reason) => {
-                        println!("Path ({}, {}) is now closed and unusable; err = {}, reason = {:?}",
+                        info!("Path ({}, {}) is now closed and unusable; err = {}, reason = {:?}",
                             local_addr, peer_addr, e, reason);
                     }
 
                     quiche::PathEvent::ReusedSourceConnectionId(cid_seq, old, new) => {
-                        println!("Peer reused cid seq {} (initially {:?}) on {:?}",
+                        info!("Peer reused cid seq {} (initially {:?}) on {:?}",
                             cid_seq, old, new);
                     }
 

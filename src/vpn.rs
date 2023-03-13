@@ -220,7 +220,7 @@ pub async fn transfer(
     shutdown_complete: mpsc::Sender<()>,
     enable_pktlog: bool,
     show_stats: bool,
-) {
+) -> anyhow::Result<()> {
     if let Ok(tap) = Tap::new() {
         let tap = Arc::new(tap);
         let pcap_writer = if enable_pktlog {
@@ -307,6 +307,7 @@ pub async fn transfer(
         }
         info!("Transfer ends: Tap: {:?}", &tap);
     }
+    Ok(())
 }
 
 async fn remote_to_local(

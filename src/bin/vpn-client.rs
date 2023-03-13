@@ -6,6 +6,7 @@ use rqst::vpn;
 use std::env;
 use std::path::PathBuf;
 use tokio::sync::{broadcast, mpsc};
+use tokio::task::JoinSet;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -75,6 +76,13 @@ async fn main() -> anyhow::Result<()> {
     };
     let _logger_handle = logger.start()?;
 
+    if let Err(e) = do_service(&matches).await {
+        error!("{:?}", e);
+    }
+    Ok(())
+}
+
+async fn do_service(matches: &clap::ArgMatches) -> anyhow::Result<()> {
     let url = matches.value_of("URL").unwrap();
     let url = url::Url::parse(url).unwrap();
 
@@ -128,6 +136,7 @@ async fn main() -> anyhow::Result<()> {
     config.set_disable_active_migration(true);
     config.enable_early_data();
     config.enable_dgram(true, 1000, 1000);
+    config.set_multipath(true);
 
     let mut keylog = None;
 
@@ -170,7 +179,8 @@ async fn main() -> anyhow::Result<()> {
         },
     };
 
-    let task = tokio::spawn(vpn::transfer(
+    let mut set = JoinSet::new();
+    set.spawn(vpn::transfer(
         conn.clone(),
         notify_shutdown.subscribe(),
         notify_shutdown.subscribe(),
@@ -178,8 +188,71 @@ async fn main() -> anyhow::Result<()> {
         matches.is_present("pktlog"),
         false,
     ));
+
+    if let Ok(paths) = conn.path_stats().await {
+        assert_eq!(paths.len(), 1);
+        let mut local_addr = paths[0].local_addr;
+        let peer_addr = paths[0].peer_addr;
+
+        conn.insert_group(local_addr, peer_addr, 1).await.ok();
+
+        local_addr.set_port(local_addr.port() + 1);
+        match conn.probe_path(local_addr, peer_addr).await {
+            Ok(seq) => {
+                info!("probe_path: dcid seq={}", seq);
+            }
+            Err(e) => {
+                info!("failed to probe_path: {:?}", e);
+            }
+        }
+    }
+
     tokio::select! {
-        _ = task => {},
+        res = set.join_next(), if !set.is_empty() => {
+            if let Some(ret) = res {
+                ret?;
+            }
+        },
+        res = conn.path_event() => {
+            let event = res.map_err(|e| anyhow!(e))
+                .context("path_event()")?;
+            match event {
+                quiche::PathEvent::New(..) => unreachable!(),
+
+                quiche::PathEvent::Validated(local_addr, peer_addr) => {
+                    info!("Path ({}, {}) is now validated", local_addr, peer_addr);
+                    conn.set_active(local_addr, peer_addr, true).await.ok();
+                }
+
+                quiche::PathEvent::ReturnAvailable(local_addr, peer_addr) => {
+                    info!("Path ({}, {})'s return is now available", local_addr, peer_addr);
+                    conn.insert_group(local_addr, peer_addr, 2).await.ok();
+                }
+
+                quiche::PathEvent::FailedValidation(local_addr, peer_addr) => {
+                    info!("Path ({}, {}) failed validation", local_addr, peer_addr);
+                }
+
+                quiche::PathEvent::Closed(local_addr, peer_addr, e, reason) => {
+                    info!("Path ({}, {}) is now closed and unusable; err = {}, reason = {:?}",
+                        local_addr, peer_addr, e, reason);
+                }
+
+                quiche::PathEvent::ReusedSourceConnectionId(cid_seq, old, new) => {
+                    info!("Peer reused cid seq {} (initially {:?}) on {:?}",
+                        cid_seq, old, new);
+                }
+
+                quiche::PathEvent::PeerMigrated(..) => unreachable!(),
+
+                quiche::PathEvent::PeerPathStatus(..) => {},
+
+                quiche::PathEvent::InsertGroup(..) => unreachable!(),
+
+                quiche::PathEvent::RemoveGroup(..) => unreachable!(),
+            }
+        },
+
         _ = tokio::signal::ctrl_c() => {
             drop(notify_shutdown);
         }
