@@ -13,8 +13,8 @@ use tokio::time::sleep;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TunnelMsg {
-    dscp: u8,
-    group_id: u64,
+    pub dscp: u8,
+    pub group_id: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
