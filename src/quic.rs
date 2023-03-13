@@ -265,7 +265,6 @@ impl QuicActor {
                                 } else {
                                     local
                                 };
-                                info!("from: {:?}, to: {:?}", from, to);
                                 yield((buf, from, to));
                             },
                             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {

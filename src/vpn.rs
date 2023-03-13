@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 use tokio::sync::{broadcast, mpsc};
 use tokio::time::sleep;
+use etherparse::{PacketHeaders, IpHeader, Ipv4Header, Ipv6Header};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TunnelMsg {
@@ -362,7 +363,7 @@ async fn local_to_remote(
     pcap_writer: Option<Arc<Mutex<PcapWriter<File>>>>,
     mut notify_shutdown: broadcast::Receiver<()>,
     _shutdown_complete: mpsc::Sender<()>,
-) {
+) -> anyhow::Result<()>{
     'main: loop {
         let mut buf = BytesMut::with_capacity(1350);
         buf.resize(1350, 0);
@@ -382,6 +383,27 @@ async fn local_to_remote(
                             }
                         }
                         let buf = buf.freeze();
+                        let frame = PacketHeaders::from_ethernet_slice(&buf[..])
+                            .context("parse ether frame")?;
+                        match frame.ip {
+                            Some(IpHeader::Version4(hdr, _)) => {
+                                match hdr.differentiated_services_code_point {
+                                    40 => {
+                                        info!("Zoom Video");
+                                    }
+                                    56 => {
+                                        info!("Zoom Audio");
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            Some(IpHeader::Version6(hdr, _)) => {
+                                if hdr.traffic_class != 0 {
+                                    info!("{:?}", hdr);
+                                }
+                            }
+                            _ => {}
+                        }
                         match quic.send_dgram(&buf, 0).await {
                             Ok(_) => {
                                 trace!("Send dgram {} bytes", n);
@@ -403,4 +425,5 @@ async fn local_to_remote(
             },
         }
     }
+    Ok(())
 }
