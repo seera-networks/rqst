@@ -1,10 +1,12 @@
 extern crate env_logger;
 
-use rqst::{quic::*, vpn};
+use anyhow::{anyhow, Context};
+use log::{error, info};
+use rqst::{quic::*, vpn::*};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc};
-use std::net::{SocketAddr, IpAddr, Ipv4Addr, Ipv6Addr};
-use anyhow::anyhow;
+use tokio::task::JoinSet;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -64,18 +66,37 @@ async fn main() -> anyhow::Result<()> {
     let local = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 4433);
     quic.listen(local).await.unwrap();
 
+    let mut set = JoinSet::new();
     loop {
         tokio::select! {
             Ok(conn) = quic.accept() => {
-                println!("Connection accepted: {}", conn.conn_handle);
+                info!("Connection accepted: {}", conn.conn_handle);
                 let notify_shutdown_rx = notify_shutdown.subscribe();
                 let shutdown_complete_tx1 = shutdown_complete_tx.clone();
-                tokio::spawn( async move {
+                set.spawn( async move {
                     process_client(conn, notify_shutdown_rx, shutdown_complete_tx1).await
                 });
             },
+            res = set.join_next(), if !set.is_empty() => {
+                if let Some(res) = res {
+                    match res? {
+                        Ok(_) => {
+                            info!("process_client() successfuly finish.");
+                        }
+                        Err(e) => {
+                            error!("Error occured in process_client(): {:?}", e);
+                        }
+                    }
+                }
+            }
             _ = tokio::signal::ctrl_c() => {
+                info!("Request shutdown.");
                 drop(notify_shutdown);
+                while let Some(res) = set.join_next().await {
+                    if let Err(e) = res? {
+                        error!("Error occured in process_client(): {:?}", e);
+                    }
+                }
                 break;
             },
         };
@@ -89,46 +110,42 @@ async fn main() -> anyhow::Result<()> {
 async fn process_client(
     conn: QuicConnectionHandle,
     mut notify_shutdown: broadcast::Receiver<()>,
-    _shutdown_complete: mpsc::Sender<()>
+    shutdown_complete: mpsc::Sender<()>,
 ) -> anyhow::Result<()> {
-    println!("enter loop");
-    let mut ctrlmng = vpn::ControlManager::new(true);
+    info!("Enter loop");
+    let mut ctrlmng = ControlManager::new(true);
+    let mut notify_shutdown_subprocess = None;
+    let mut set = JoinSet::new();
 
-    let mut now = Instant::now();
-    let mut bytes = 0;
     loop {
-        let elapsed = Instant::now().duration_since(now);
-        if elapsed >= Duration::from_secs(1) {
-            if let Ok((front_len, queue_byte_size, queue_len)) = conn.recv_dgram_info().await {
-                println!(
-                    "front_len: {} bytes, queue_byte_size: {} bytes, queue_len: {} counts",
-                    front_len.unwrap_or(0),
-                    queue_byte_size,
-                    queue_len
-                );
-                now = Instant::now();
-            }
-            println!("{:.3} Mbps", bytes as f64 * 8.0 / (1024.0 * 1024.0) / elapsed.as_secs_f64());
-            bytes = 0;
-        }
         tokio::select! {
-            _ = conn.recv_dgram_ready() => {
-                let ret = conn.recv_dgram_vectored(1).await;
-                match ret {
-                    Ok(bufs) => {
-                        bytes += bufs.iter().map(|x| x.len()).sum::<usize>();
-                    }
-                    Err(e) => {
-                        println!("recv_dgram: failed: {:?}", e);
-                        break;
-                    }
-                }
-            },
-            readable = conn.recv_stream_ready(None) => {
-                let readable = readable.map_err(|e| anyhow!(e))?;
+            res = conn.recv_stream_ready(None, None) => {
+            //res = conn.recv_stream_ready(None, Some((true, false, false, false))) => {
+                let readable = res.map_err(|e| anyhow!(e))
+                    .context("check stream's readness")?;
                 for stream_id in readable {
-                    if let Some((seq, msg)) = ctrlmng.recv_message(&conn, stream_id).await? {
-                        println!("seq={}, msg={:?}", seq, msg);
+                    match ctrlmng.recv_request(&conn, stream_id).await.with_context(|| format!("receive and parse request in {} stream", stream_id))? {
+                        Some((seq, RequestMsg::Start)) => {
+                            info!("Recv start request");
+                            let (notify_shutdown_tx, notify_shutdown_rx) = broadcast::channel(1);
+                            notify_shutdown_subprocess = Some(notify_shutdown_tx);
+                            let conn1 = conn.clone();
+                            let shutdown_complete1 = shutdown_complete.clone();
+                            set.spawn(async move {
+                                subprocess_client(conn1, notify_shutdown_rx, shutdown_complete1).await
+                            });
+                            ctrlmng.send_response_ok(&conn, seq).await?;
+                        }
+                        Some((seq, RequestMsg::Stop)) => {
+                            info!("Recv stop request");
+                            if let Some(notify) = notify_shutdown_subprocess.take() {
+                                drop(notify);
+                                ctrlmng.send_response_ok(&conn, seq).await?;
+                            } else {
+                                ctrlmng.send_response_err(&conn, seq, "Not running").await?;
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -148,7 +165,7 @@ async fn process_client(
                             quiche::PathEvent::ReturnAvailable(local_addr, peer_addr) => {
                                 println!("Path ({}, {})'s return is now available", local_addr, peer_addr);
                             }
-                            
+
                             quiche::PathEvent::FailedValidation(local_addr, peer_addr) => {
                                 println!("Path ({}, {}) failed validation", local_addr, peer_addr);
                             }
@@ -181,14 +198,59 @@ async fn process_client(
                 }
             },
 
-            _ = tokio::time::sleep(Duration::from_secs(0)) => {}
+            res = set.join_next(), if !set.is_empty() => {
+                if let Some(res) = res {
+                    match res? {
+                        Ok(_) => {
+                            info!("subprocess_client() successfuly finish");
+                        }
+                        Err(e) => {
+                            info!("Error occured in subprocess_client(): {:?}", e);
+                        }
+                    }
+                }
+            }
             _ = notify_shutdown.recv() => {
-                println!("leave loop");
+                info!("Shutdown requested");
+                drop(notify_shutdown_subprocess);
+                while let Some(res) = set.join_next().await {
+                    if let Err(e) = res? {
+                        error!("Error occured in process_client(): {:?}", e);
+                    }
+                }
                 break;
             }
         }
     }
     conn.close().await.unwrap();
-    println!("leave loop");
+    info!("leave loop");
+    Ok(())
+}
+
+async fn subprocess_client(
+    conn: QuicConnectionHandle,
+    mut notify_shutdown: broadcast::Receiver<()>,
+    _shutdown_complete: mpsc::Sender<()>,
+) -> anyhow::Result<()> {
+    info!("Enter loop");
+    loop {
+        tokio::select! {
+            res = conn.recv_dgram_ready() => {
+                let _ = res.map_err(|e| anyhow!(e))
+                    .context("check dgram's readness")?;
+                let buf = conn.recv_dgram().await
+                    .map_err(|e| anyhow!(e))
+                    .context("recv_dgram()")?;
+                conn.send_dgram(&buf, 0).await
+                    .map_err(|e| anyhow!(e))
+                    .context("send_dgram")?;
+            },
+            _ = notify_shutdown.recv() => {
+                println!("Shutdown requested");
+                break;
+            }
+        }
+    }
+    info!("Leave loop");
     Ok(())
 }

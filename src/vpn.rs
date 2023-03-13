@@ -1,16 +1,15 @@
 use crate::quic::*;
 use crate::tap::Tap;
-use bytes::{Bytes, BytesMut, Buf, BufMut};
+use anyhow::{anyhow, Context};
+use bytes::{BufMut, BytesMut};
 use pcap_file::pcap::PcapWriter;
+use serde::{Deserialize, Serialize};
+use std::collections::{btree_map, BTreeMap};
 use std::fs::{File, OpenOptions};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
-use std::collections::{BTreeMap, btree_map};
 use tokio::sync::{broadcast, mpsc};
 use tokio::time::sleep;
-use serde::{Deserialize, Serialize};
-use anyhow::anyhow;
-
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TunnelMsg {
@@ -28,19 +27,12 @@ pub enum RequestMsg {
 #[derive(Debug, Serialize, Deserialize)]
 pub enum ResponseMsg {
     Ok,
-    Err(String)
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub enum Message {
-    Request(RequestMsg),
-    Response(ResponseMsg),
+    Err(String),
 }
 
 pub struct ControlManager {
     next_msg_seq: u64,
     request_buf: BTreeMap<u64, Vec<u8>>,
-    response_buf: BTreeMap<u64, Vec<u8>>,
     is_server: bool,
 }
 
@@ -49,77 +41,176 @@ impl ControlManager {
         ControlManager {
             next_msg_seq: 0,
             request_buf: BTreeMap::new(),
-            response_buf: BTreeMap::new(),
             is_server,
         }
     }
 
-    pub async fn send_start(&mut self, quic: &QuicConnectionHandle) -> anyhow::Result<()> {
+    pub async fn send_start_request(&mut self, conn: &QuicConnectionHandle) -> anyhow::Result<u64> {
         if self.is_server {
-            return(Err(anyhow!("Sending Start not allowed by server")));
+            return Err(anyhow!("Sending Start not allowed by server"));
         }
-        let j = serde_json::to_string(&RequestMsg::Start)?;
+        let msg = serde_json::to_string(&RequestMsg::Start)
+            .context("serialize message")?;
+
+        self.send_request(conn, &msg).await
+            .context("sending request")
+    }
+
+    pub async fn send_stop_request(&mut self, conn: &QuicConnectionHandle) -> anyhow::Result<u64> {
+        if self.is_server {
+            return Err(anyhow!("Sending Stop not allowed by server"));
+        }
+        let msg = serde_json::to_string(&RequestMsg::Stop)
+            .context("serialize message")?;
+        self.send_request(conn, &msg).await
+            .context("sending request")
+    }
+
+    async fn send_request(
+        &mut self,
+        conn: &QuicConnectionHandle,
+        msg: &String,
+    ) -> anyhow::Result<u64> {
+        let seq = self.next_msg_seq;
+        let stream_id = if !self.is_server {
+            // Client -> Server
+            seq.saturating_mul(4)
+        } else {
+            // Server -> Client
+            seq.saturating_mul(4).saturating_add(1)
+        };
+        self.next_msg_seq = seq.saturating_add(1);
 
         let mut buf = BytesMut::new();
-        buf.put(j.as_bytes());
-        let stream_id = self.next_msg_seq.saturating_mul(4);
-        self.next_msg_seq = self.next_msg_seq.saturating_add(1);
-        quic.send_stream(&buf.freeze(), stream_id, true).await.map_err(|e| anyhow!(e))?;
+        buf.put(msg.as_bytes());
+        conn.send_stream(&buf.freeze(), stream_id, true)
+            .await
+            .map_err(|e| anyhow!(e))
+            .context("send_stream()")?;
+
+        Ok(seq)
+    }
+    
+    pub async fn send_response_ok(
+        &self,
+        conn: &QuicConnectionHandle,
+        seq: u64
+    ) -> anyhow::Result<()> {
+        let msg = serde_json::to_string(&ResponseMsg::Ok)
+            .context("serialize message")?;
+
+        self.send_response(conn, seq, &msg).await
+            .context("sending response")
+    }
+
+    pub async fn send_response_err(
+        &self,
+        conn: &QuicConnectionHandle,
+        seq: u64,
+        reason: &str,
+    ) -> anyhow::Result<()> {
+        let msg = serde_json::to_string(&ResponseMsg::Err(reason.to_string()))
+            .context("serialize message")?;
+
+        self.send_response(conn, seq, &msg).await
+            .context("sending response")
+    }
+
+    async fn send_response(
+        &self,
+        conn: &QuicConnectionHandle,
+        seq: u64,
+        msg: &String,
+    ) -> anyhow::Result<()> {
+        let stream_id = if self.is_server {
+            // Server -> Client
+            seq.saturating_mul(4)
+        } else {
+            // Client -> Server
+            seq.saturating_mul(4).saturating_add(1)
+        };
+
+        let mut buf = BytesMut::new();
+        buf.put(msg.as_bytes());
+        conn.send_stream(&buf.freeze(), stream_id, true)
+            .await
+            .map_err(|e| anyhow!(e))
+            .context("send_stream()")?;
         Ok(())
     }
 
-    pub async fn recv_message(&mut self, quic: &QuicConnectionHandle, stream_id: u64) -> anyhow::Result<Option<(u64, Message)>> {
-        let (buf, fin) = quic.recv_stream(stream_id).await
-            .map_err(|e| anyhow!(e))?
-            .ok_or(anyhow!("Not readable stream"))?;
-
-        let (seq, mut entry) = match (stream_id & 0x03, self.is_server) {
+    pub async fn recv_request(
+        &mut self,
+        quic: &QuicConnectionHandle,
+        stream_id: u64,
+    ) -> anyhow::Result<Option<(u64, RequestMsg)>> {
+        let seq = match (stream_id & 0x03, self.is_server) {
             (0x00, true) | (0x01, false) => {
-                let seq = if self.is_server {
+                if self.is_server {
                     stream_id.saturating_div(4)
                 } else {
                     stream_id.saturating_sub(1).saturating_div(4)
-                };
-                let storage = self.request_buf
-                    .entry(seq)
-                    .or_insert(Vec::new());
-                storage.put(buf);
-                let entry = self.request_buf.entry(seq);
-                (seq, entry)
-            },
-            (0x00, false) | (0x01, true) => {
-                let seq = if self.is_server {
-                    stream_id.saturating_div(4)
-                } else {
-                    stream_id.saturating_sub(1).saturating_div(4)
-                };
-                let storage = self.response_buf
-                    .entry(seq)
-                    .or_insert(Vec::new());
-                storage.put(buf);
-                let entry = self.response_buf.entry(seq);
-                (seq, entry)
-            },
+                }
+            }
             _ => {
                 return Err(anyhow!("Invalid stream: {}", stream_id));
             }
         };
 
+        let (buf, fin) = quic
+            .recv_stream(stream_id)
+            .await
+            .map_err(|e| anyhow!(e))
+            .with_context(|| format!("recv_stream() for {} stream", stream_id))?
+            .ok_or(anyhow!("Not readable stream"))?;
+
+        let storage = self.request_buf
+            .entry(seq)
+            .or_insert(Vec::new());
+
+        storage.put(buf);
+
         if fin {
-            if let btree_map::Entry::Occupied(entry) = entry {
-                let storage = entry.get();
-                let msg: Message = serde_json::from_slice(&storage[..])?;
-                entry.remove();
-                Ok(Some((seq, msg)))
-            } else {
-                unreachable!()
-            }
+            let msg: RequestMsg = serde_json::from_slice(&storage[..]).context("deserialize message")?;
+            self.request_buf.remove(&seq);
+            Ok(Some((seq, msg)))
         } else {
             Ok(None)
         }
     }
-}
 
+    pub async fn recv_response(
+        &mut self,
+        quic: &QuicConnectionHandle,
+        seq: u64,
+    ) -> anyhow::Result<ResponseMsg> {
+        let stream_id = if !self.is_server {
+            // Server -> Client
+            seq.saturating_mul(4)
+        } else {
+            // Client -> Server
+            seq.saturating_mul(4).saturating_add(1)
+        };
+
+        let mut storage = Vec::new();
+
+        loop {
+            let (buf, fin) = quic
+                .recv_stream(stream_id)
+                .await
+                .map_err(|e| anyhow!(e))
+                .with_context(|| format!("recv_stream() for {} stream", stream_id))?
+                .ok_or(anyhow!("Not readable stream"))?;
+
+            storage.put(buf);
+
+            if fin {
+                let msg: ResponseMsg = serde_json::from_slice(&storage[..]).context("deserialize message")?;
+                return Ok(msg);
+            }
+        }
+    }
+}
 
 pub async fn transfer(
     quic: QuicConnectionHandle,

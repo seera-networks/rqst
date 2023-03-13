@@ -58,6 +58,7 @@ enum ActorMessage {
     RecvStreamReadness {
         conn_handle: ConnectionHandle,
         stream_ids: Option<Vec<u64>>,
+        filter: Option<(bool, bool, bool, bool)>,
         respond_to: oneshot::Sender<Result<Vec<u64>>>,
     },
     RecvStream {
@@ -179,7 +180,8 @@ struct SendDgramRequest {
 
 struct RecvStreamReadnessRequest {
     stream_ids: Option<Vec<u64>>,
-    respond_to: oneshot::Sender<Result<Vec<u64>>>,
+    filter: Option<(bool, bool, bool, bool)>,
+    respond_to: Option<oneshot::Sender<Result<Vec<u64>>>>,
 }
 
 struct SendStreamRequest {
@@ -373,8 +375,10 @@ impl QuicActor {
             ActorMessage::RecvStreamReadness {
                 conn_handle,
                 stream_ids,
+                filter,
                 respond_to,
             } => {
+                let filter = filter.unwrap_or((true, true, true, true));
                 if let Some(conn) = self.conns.get_mut(&conn_handle) {
                     let readable = if let Some(stream_ids) = &stream_ids {
                         let stream_ids = stream_ids.iter().cloned().collect::<HashSet<u64>>();
@@ -382,9 +386,29 @@ impl QuicActor {
                         stream_ids
                             .intersection(&readable)
                             .cloned()
+                            .filter(|id| {
+                                match (*id & 0x03, filter) {
+                                    (0x00, (true, _, _, _))
+                                    | (0x01, (_, true, _, _))
+                                    | (0x02, (_, _, true, _))
+                                    | (0x03, (_, _, _, true)) => true,
+                                    _ => false,
+                                }
+                            })
                             .collect::<Vec<u64>>()
                     } else {
-                        conn.quiche_conn.readable().collect::<Vec<u64>>()
+                        conn.quiche_conn
+                            .readable()
+                            .filter(|id| {
+                                match (*id & 0x03, filter) {
+                                    (0x00, (true, _, _, _))
+                                    | (0x01, (_, true, _, _))
+                                    | (0x02, (_, _, true, _))
+                                    | (0x03, (_, _, _, true)) => true,
+                                    _ => false,
+                                }
+                            })
+                            .collect::<Vec<u64>>()
                     };
                     if !readable.is_empty() {
                         respond_to.send(Ok(readable)).ok();
@@ -392,7 +416,8 @@ impl QuicActor {
                         conn.recv_stream_readness_requests
                             .push_back(RecvStreamReadnessRequest {
                                 stream_ids,
-                                respond_to,
+                                filter: Some(filter),
+                                respond_to: Some(respond_to),
                             });
                     }
                 } else {
@@ -899,28 +924,6 @@ impl QuicActor {
                     conn.before_established = false;
                 }
 
-                if !conn.recv_stream_readness_requests.is_empty()
-                    && conn.quiche_conn.readable().next().is_some()
-                {
-                    while let Some(request) = conn.recv_stream_readness_requests.pop_front() {
-                        let readable = if let Some(stream_ids) = &request.stream_ids {
-                            let stream_ids = stream_ids.iter().cloned().collect::<HashSet<u64>>();
-                            let readable = conn.quiche_conn.readable().collect::<HashSet<u64>>();
-                            stream_ids
-                                .intersection(&readable)
-                                .cloned()
-                                .collect::<Vec<u64>>()
-                        } else {
-                            conn.quiche_conn.readable().collect::<Vec<u64>>()
-                        };
-                        if !readable.is_empty() {
-                            request.respond_to.send(Ok(readable)).ok();
-                        } else {
-                            conn.recv_stream_readness_requests.push_front(request);
-                            break;
-                        }
-                    }
-                }
                 if conn.quiche_conn.dgram_recv_queue_len() > 0 {
                     while let Some(request) = conn.recv_dgram_readness_requests.pop_front() {
                         let _ = request.respond_to.send(Ok(()));
@@ -964,6 +967,56 @@ impl QuicActor {
 
             for (conn_handle, conn) in self.conns.iter_mut() {
                 if conn.quiche_conn.is_established() {
+
+                    if !conn.recv_stream_readness_requests.is_empty()
+                        && conn.quiche_conn.readable().next().is_some()
+                    {
+
+                        conn.recv_stream_readness_requests.retain_mut(|request| {
+                            let filter = request.filter.clone().expect("not filled");
+                            let readable = if let Some(stream_ids) = &request.stream_ids {
+                                let stream_ids =
+                                    stream_ids.iter().cloned().collect::<HashSet<u64>>();
+                                let readable =
+                                    conn.quiche_conn.readable().collect::<HashSet<u64>>();
+                                stream_ids
+                                    .intersection(&readable)
+                                    .cloned()
+                                    .filter(|id| {
+                                        match (*id & 0x03, filter) {
+                                            (0x00, (true, _, _, _))
+                                            | (0x01, (_, true, _, _))
+                                            | (0x02, (_, _, true, _))
+                                            | (0x03, (_, _, _, true)) => true,
+                                            _ => false,
+                                        }
+                                    })
+                                    .collect::<Vec<u64>>()
+                            } else {
+                                conn.quiche_conn
+                                    .readable()
+                                    .filter(|id| {
+                                        match (*id & 0x03, filter) {
+                                            (0x00, (true, _, _, _))
+                                            | (0x01, (_, true, _, _))
+                                            | (0x02, (_, _, true, _))
+                                            | (0x03, (_, _, _, true)) => true,
+                                            _ => false,
+                                        }
+                                    })
+                                    .collect::<Vec<u64>>()
+                            };
+                            if !readable.is_empty() {
+                                if let Some(respond_to) =  request.respond_to.take() {
+                                    respond_to.send(Ok(readable)).ok();
+                                }
+                                false
+                            } else {
+                                true
+                            }
+                        });
+                    }
+
                     if !conn.send_stream_requests.is_empty() {
                         let queued = conn
                             .send_stream_requests
@@ -1122,10 +1175,27 @@ impl Drop for QuicConnection {
         if let Some(request) = self.connect_request.take() {
             let _ = request.respond_to.send(Err("Connection closed".into()));
         }
+        for request in self.recv_stream_readness_requests.drain(..) {
+            if let Some(respond_to) = request.respond_to {
+                let _ = respond_to.send(Err("Connection closed".into()));
+            }
+        }
+        self.send_stream_requests.retain(|_, queue| {
+            for request in queue.drain(..) {
+                let _ = request.respond_to.send(Err("Connection closed".into()));
+            }
+            false
+        });
         for request in self.recv_dgram_readness_requests.drain(..) {
             let _ = request.respond_to.send(Err("Connection closed".into()));
         }
         for request in self.send_dgram_requests.drain(..) {
+            let _ = request.respond_to.send(Err("Connection closed".into()));
+        }
+        for request in self.probe_path_requests.drain(..) {
+            let _ = request.respond_to.send(Err("Connection closed".into()));
+        }
+        for request in self.path_event_readness_requests.drain(..) {
             let _ = request.respond_to.send(Err("Connection closed".into()));
         }
     }
@@ -1154,7 +1224,11 @@ impl QuicHandle {
             shutdown_complete,
         );
 
-        tokio::spawn(async move { actor.run().await });
+        tokio::spawn(async move {
+            info!("Actor start");
+            actor.run().await;
+            info!("Actor End");
+        });
 
         Self { sender }
     }
@@ -1209,11 +1283,16 @@ pub struct QuicConnectionHandle {
 }
 
 impl QuicConnectionHandle {
-    pub async fn recv_stream_ready(&self, stream_ids: Option<Vec<u64>>) -> Result<Vec<u64>> {
+    pub async fn recv_stream_ready(
+        &self,
+        stream_ids: Option<Vec<u64>>,
+        filter: Option<(bool, bool, bool, bool)>,
+    ) -> Result<Vec<u64>> {
         let (send, recv) = oneshot::channel();
         let msg = ActorMessage::RecvStreamReadness {
             conn_handle: self.conn_handle,
             stream_ids,
+            filter,
             respond_to: send,
         };
         let _ = self.sender.send(msg).await;
@@ -1238,6 +1317,7 @@ impl QuicConnectionHandle {
                     let msg = ActorMessage::RecvStreamReadness {
                         conn_handle: self.conn_handle,
                         stream_ids: Some(vec![stream_id]),
+                        filter: None,
                         respond_to: send,
                     };
                     let _ = self.sender.send(msg).await;
@@ -1260,7 +1340,7 @@ impl QuicConnectionHandle {
         recv.await.expect("Actor task has been killed")
     }
 
-    pub async fn recv_dgram(&self) -> Result<Option<Bytes>> {
+    pub async fn recv_dgram(&self) -> Result<Bytes> {
         loop {
             let (send, recv) = oneshot::channel();
             let msg = ActorMessage::RecvDgram {
@@ -1270,7 +1350,7 @@ impl QuicConnectionHandle {
             let _ = self.sender.send(msg).await;
             match recv.await.expect("Actor task has been killed") {
                 Ok(Some(buf)) => {
-                    return Ok(Some(buf));
+                    return Ok(buf);
                 }
                 Ok(None) => {
                     let (send, recv) = oneshot::channel();
@@ -1660,7 +1740,7 @@ mod tests {
         let buf = Bytes::from("hello");
         let ret = conn.send_stream(&buf, 0, true).await;
         assert_eq!(ret.is_ok(), true);
-        let ret = conn1.recv_stream_ready(None).await;
+        let ret = conn1.recv_stream_ready(None, None).await;
         assert_eq!(ret.is_ok(), true);
         let readable = ret.unwrap();
         assert_eq!(readable, vec![0]);
@@ -1698,7 +1778,7 @@ mod tests {
         let conn1 = server.accept().await.unwrap();
 
         tokio::task::spawn(async move {
-            let ret = conn1.recv_stream_ready(None).await;
+            let ret = conn1.recv_stream_ready(None, None).await;
             assert_eq!(ret.is_ok(), true);
             let readable = ret.unwrap();
             assert_eq!(readable, vec![0]);
@@ -1710,7 +1790,7 @@ mod tests {
             assert_eq!(buf1, Bytes::from("hello "));
             assert_eq!(fin, false);
 
-            let ret = conn1.recv_stream_ready(None).await;
+            let ret = conn1.recv_stream_ready(None, None).await;
             assert_eq!(ret.is_ok(), true);
             let readable = ret.unwrap();
             assert_eq!(readable, vec![0]);
@@ -1744,9 +1824,6 @@ mod tests {
         let ret = conn1.recv_dgram().await;
         assert_eq!(ret.is_ok(), true);
         let buf1 = ret.unwrap();
-        assert_eq!(buf1.is_some(), true);
-        if let Some(buf1) = buf1 {
-            assert_eq!(buf, buf1);
-        }
+        assert_eq!(buf, buf1);
     }
 }
