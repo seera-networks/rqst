@@ -56,6 +56,13 @@ fn main() -> anyhow::Result<()> {
                 .help("CA certificate path"),
         )
         .arg(
+            clap::arg!(--port <PORT>)
+                .required(false)
+                .value_parser(clap::value_parser!(u16))
+                .default_value("4433")
+                .help("Listening UDP port"),
+        )
+        .arg(
             clap::arg!(--log <file>)
                 .required(false)
                 .value_parser(clap::value_parser!(PathBuf))
@@ -336,9 +343,21 @@ async fn tokio_main(
         shutdown_complete_tx.clone(),
     );
 
-    let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 3456);
+    let local = SocketAddr::new(
+        IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        matches
+            .get_one::<u16>("port")
+            .cloned()
+            .ok_or(anyhow!("port not provided"))?,
+    );
     quic.listen(local).await.unwrap();
-    let local = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 3456);
+    let local = SocketAddr::new(
+        IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+        matches
+            .get_one::<u16>("port")
+            .cloned()
+            .ok_or(anyhow!("port not provided"))?,
+    );
     quic.listen(local).await.unwrap();
 
     loop {
