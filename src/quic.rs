@@ -89,6 +89,12 @@ enum ActorMessage {
         fin: bool,
         respond_to: oneshot::Sender<Result<()>>,
     },
+    SetStreamGroup {
+        conn_handle: ConnectionHandle,
+        stream_id: u64,
+        group_id: u64,
+        respond_to: oneshot::Sender<Result<()>>,
+    },
     SendDgram {
         conn_handle: ConnectionHandle,
         buf: Bytes,
@@ -366,14 +372,17 @@ impl QuicActor {
             }
             ActorMessage::RecvStreamReadness {
                 conn_handle,
-                stream_ids, 
+                stream_ids,
                 respond_to,
             } => {
                 if let Some(conn) = self.conns.get_mut(&conn_handle) {
                     let readable = if let Some(stream_ids) = &stream_ids {
                         let stream_ids = stream_ids.iter().cloned().collect::<HashSet<u64>>();
                         let readable = conn.quiche_conn.readable().collect::<HashSet<u64>>();
-                        stream_ids.intersection(&readable).cloned().collect::<Vec<u64>>()
+                        stream_ids
+                            .intersection(&readable)
+                            .cloned()
+                            .collect::<Vec<u64>>()
                     } else {
                         conn.quiche_conn.readable().collect::<Vec<u64>>()
                     };
@@ -381,7 +390,10 @@ impl QuicActor {
                         respond_to.send(Ok(readable)).ok();
                     } else {
                         conn.recv_stream_readness_requests
-                            .push_back(RecvStreamReadnessRequest { stream_ids, respond_to });
+                            .push_back(RecvStreamReadnessRequest {
+                                stream_ids,
+                                respond_to,
+                            });
                     }
                 } else {
                     respond_to
@@ -542,6 +554,29 @@ impl QuicActor {
                         Err(e) => {
                             respond_to
                                 .send(Err(format!("dgram_send failed: {:?}", e).into()))
+                                .ok();
+                        }
+                    }
+                } else {
+                    respond_to
+                        .send(Err(format!("No Connection: {:?}", conn_handle).into()))
+                        .ok();
+                }
+            }
+            ActorMessage::SetStreamGroup {
+                conn_handle,
+                stream_id,
+                group_id,
+                respond_to,
+            } => {
+                if let Some(conn) = self.conns.get_mut(&conn_handle) {
+                    match conn.quiche_conn.stream_group(stream_id, group_id) {
+                        Ok(_) => {
+                            respond_to.send(Ok(())).ok();
+                        }
+                        Err(e) => {
+                            respond_to
+                                .send(Err(format!("stream_group failed: {:?}", e).into()))
                                 .ok();
                         }
                     }
@@ -864,14 +899,17 @@ impl QuicActor {
                     conn.before_established = false;
                 }
 
-                if !conn.recv_stream_readness_requests.is_empty() &&
-                    conn.quiche_conn.readable().next().is_some()
+                if !conn.recv_stream_readness_requests.is_empty()
+                    && conn.quiche_conn.readable().next().is_some()
                 {
                     while let Some(request) = conn.recv_stream_readness_requests.pop_front() {
                         let readable = if let Some(stream_ids) = &request.stream_ids {
                             let stream_ids = stream_ids.iter().cloned().collect::<HashSet<u64>>();
                             let readable = conn.quiche_conn.readable().collect::<HashSet<u64>>();
-                            stream_ids.intersection(&readable).cloned().collect::<Vec<u64>>()
+                            stream_ids
+                                .intersection(&readable)
+                                .cloned()
+                                .collect::<Vec<u64>>()
                         } else {
                             conn.quiche_conn.readable().collect::<Vec<u64>>()
                         };
@@ -1057,7 +1095,6 @@ impl QuicActor {
                             break;
                         }
                     };
-                    println!("from: {:?}", &send_info.from);
                     let socket = conn.locals_to_sockets.get(&send_info.from).unwrap();
                     match send_sas(socket, &self.out[..write], &send_info.to, &send_info.from).await
                     {
@@ -1303,6 +1340,18 @@ impl QuicConnectionHandle {
         recv.await.expect("Actor task has been killed")
     }
 
+    pub async fn set_stream_group(&self, stream_id: u64, group_id: u64) -> Result<()> {
+        let (send, recv) = oneshot::channel();
+        let msg = ActorMessage::SetStreamGroup {
+            conn_handle: self.conn_handle,
+            stream_id,
+            group_id,
+            respond_to: send,
+        };
+        let _ = self.sender.send(msg).await;
+        recv.await.expect("Actor task has been killed")
+    }
+
     pub async fn send_dgram(&self, buf: &Bytes, group_id: u64) -> Result<()> {
         let (send, recv) = oneshot::channel();
         let msg = ActorMessage::SendDgram {
@@ -1464,6 +1513,26 @@ fn generate_cid_and_reset_token(conn_id_len: usize) -> (quiche::ConnectionId<'st
 pub mod testing {
     use super::*;
 
+    pub async fn open_server_with_config(
+        config: quiche::Config,
+        port: u16,
+        shutdown_complete_tx: mpsc::Sender<()>,
+    ) -> Result<QuicHandle> {
+        let quic = QuicHandle::new(
+            config,
+            None,
+            quiche::MAX_CONN_ID_LEN,
+            false,
+            shutdown_complete_tx.clone(),
+        );
+
+        let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port);
+        quic.listen(local).await.unwrap();
+        let local = SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1)), port);
+        quic.listen(local).await.unwrap();
+        Ok(quic)
+    }
+
     pub async fn open_server(
         port: u16,
         shutdown_complete_tx: mpsc::Sender<()>,
@@ -1485,6 +1554,13 @@ pub mod testing {
         config.enable_early_data();
         config.enable_dgram(true, 1000, 1000);
 
+        open_server_with_config(config, port, shutdown_complete_tx).await
+    }
+
+    pub fn open_client_with_config(
+        config: quiche::Config,
+        shutdown_complete_tx: mpsc::Sender<()>,
+    ) -> Result<QuicHandle> {
         let quic = QuicHandle::new(
             config,
             None,
@@ -1492,15 +1568,10 @@ pub mod testing {
             false,
             shutdown_complete_tx.clone(),
         );
-
-        let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port);
-        quic.listen(local).await.unwrap();
-        let local = SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1)), port);
-        quic.listen(local).await.unwrap();
         Ok(quic)
     }
 
-    pub async fn open_client(shutdown_complete_tx: mpsc::Sender<()>) -> Result<QuicHandle> {
+    pub fn open_client(shutdown_complete_tx: mpsc::Sender<()>) -> Result<QuicHandle> {
         let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION)?;
         config.set_application_protos(&[b"proto1"])?;
         config.verify_peer(false);
@@ -1517,14 +1588,7 @@ pub mod testing {
         config.enable_early_data();
         config.enable_dgram(true, 1000, 1000);
 
-        let quic = QuicHandle::new(
-            config,
-            None,
-            quiche::MAX_CONN_ID_LEN,
-            false,
-            shutdown_complete_tx.clone(),
-        );
-        Ok(quic)
+        open_client_with_config(config, shutdown_complete_tx)
     }
 }
 
@@ -1538,9 +1602,7 @@ mod tests {
         let _server = testing::open_server(12345, shutdown_complete_tx.clone())
             .await
             .unwrap();
-        let client = testing::open_client(shutdown_complete_tx.clone())
-            .await
-            .unwrap();
+        let client = testing::open_client(shutdown_complete_tx.clone()).unwrap();
         let url = url::Url::parse("http://127.0.0.1:12345").unwrap();
         let ret = client.connect(url).await;
         assert_eq!(ret.is_ok(), true);
@@ -1552,9 +1614,7 @@ mod tests {
         let _server = testing::open_server(12346, shutdown_complete_tx.clone())
             .await
             .unwrap();
-        let client = testing::open_client(shutdown_complete_tx.clone())
-            .await
-            .unwrap();
+        let client = testing::open_client(shutdown_complete_tx.clone()).unwrap();
         let url = url::Url::parse("http://[::1]:12346").unwrap();
         let ret = client.connect(url).await;
         assert_eq!(ret.is_ok(), true);
@@ -1566,9 +1626,7 @@ mod tests {
         let server = testing::open_server(12347, shutdown_complete_tx.clone())
             .await
             .unwrap();
-        let client = testing::open_client(shutdown_complete_tx.clone())
-            .await
-            .unwrap();
+        let client = testing::open_client(shutdown_complete_tx.clone()).unwrap();
         let url = url::Url::parse("http://127.0.0.1:12347").unwrap();
         let _ = client.connect(url).await;
         let ret = server.accept().await;
@@ -1581,9 +1639,7 @@ mod tests {
         let server = testing::open_server(12348, shutdown_complete_tx.clone())
             .await
             .unwrap();
-        let client = testing::open_client(shutdown_complete_tx.clone())
-            .await
-            .unwrap();
+        let client = testing::open_client(shutdown_complete_tx.clone()).unwrap();
         let url = url::Url::parse("http://[::1]:12348").unwrap();
         let _ = client.connect(url).await;
         let ret = server.accept().await;
@@ -1596,9 +1652,7 @@ mod tests {
         let server = testing::open_server(12349, shutdown_complete_tx.clone())
             .await
             .unwrap();
-        let client = testing::open_client(shutdown_complete_tx.clone())
-            .await
-            .unwrap();
+        let client = testing::open_client(shutdown_complete_tx.clone()).unwrap();
         let url = url::Url::parse("http://127.0.0.1:12349").unwrap();
         let conn = client.connect(url).await.unwrap();
         let conn1 = server.accept().await.unwrap();
@@ -1620,14 +1674,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stream_with_short_buf() {
+        let (shutdown_complete_tx, _) = mpsc::channel(1);
+        let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
+        config
+            .load_cert_chain_from_pem_file("src/cert.crt")
+            .unwrap();
+        config.load_priv_key_from_pem_file("src/cert.key").unwrap();
+        config.set_application_protos(&[b"proto1"]).unwrap();
+        config.set_initial_max_data(6);
+        config.set_initial_max_stream_data_bidi_local(6);
+        config.set_initial_max_stream_data_bidi_remote(6);
+        config.set_initial_max_stream_data_uni(10);
+        config.set_initial_max_streams_bidi(100);
+        config.set_initial_max_streams_uni(100);
+
+        let server = testing::open_server_with_config(config, 12349, shutdown_complete_tx.clone())
+            .await
+            .unwrap();
+        let client = testing::open_client(shutdown_complete_tx.clone()).unwrap();
+        let url = url::Url::parse("http://127.0.0.1:12349").unwrap();
+        let conn = client.connect(url).await.unwrap();
+        let conn1 = server.accept().await.unwrap();
+
+        tokio::task::spawn(async move {
+            let ret = conn1.recv_stream_ready(None).await;
+            assert_eq!(ret.is_ok(), true);
+            let readable = ret.unwrap();
+            assert_eq!(readable, vec![0]);
+            let ret = conn1.recv_stream(0).await;
+            assert_eq!(ret.is_ok(), true);
+            let ret = ret.unwrap();
+            assert_eq!(ret.is_some(), true);
+            let (buf1, fin) = ret.unwrap();
+            assert_eq!(buf1, Bytes::from("hello "));
+            assert_eq!(fin, false);
+
+            let ret = conn1.recv_stream_ready(None).await;
+            assert_eq!(ret.is_ok(), true);
+            let readable = ret.unwrap();
+            assert_eq!(readable, vec![0]);
+            let ret = conn1.recv_stream(0).await;
+            assert_eq!(ret.is_ok(), true);
+            let ret = ret.unwrap();
+            assert_eq!(ret.is_some(), true);
+            let (buf1, fin) = ret.unwrap();
+            assert_eq!(buf1, Bytes::from("world"));
+            assert_eq!(fin, true);
+        });
+
+        let buf = Bytes::from("hello world");
+        let ret = conn.send_stream(&buf, 0, true).await;
+        assert_eq!(ret.is_ok(), true);
+    }
+
+    #[tokio::test]
     async fn dgram() {
         let (shutdown_complete_tx, _) = mpsc::channel(1);
         let server = testing::open_server(12349, shutdown_complete_tx.clone())
             .await
             .unwrap();
-        let client = testing::open_client(shutdown_complete_tx.clone())
-            .await
-            .unwrap();
+        let client = testing::open_client(shutdown_complete_tx.clone()).unwrap();
         let url = url::Url::parse("http://127.0.0.1:12349").unwrap();
         let conn = client.connect(url).await.unwrap();
         let conn1 = server.accept().await.unwrap();

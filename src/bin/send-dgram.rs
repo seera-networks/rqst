@@ -150,25 +150,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                             break;
                         }
                     }
-
                 }
-                /*
-                res = conn.send_dgram(&buf) => {
-                    match res {
-                        Ok(_) => {
-                            if let Some(new_count) = count.checked_add(1) {
-                                count = new_count;
-                            } else {
-                                count = 0;
-                            }
-                        }
-                        Err(e) => {
-                            println!("Send failed: {:?}", e);
-                            break;
-                        }
-                    }
-                },
-                */
                 res = conn.path_event() => {
                     match res {
                         Ok(event) => {
