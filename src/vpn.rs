@@ -12,26 +12,26 @@ use serde::{Deserialize, Serialize};
 use anyhow::anyhow;
 
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct TunnelMsg {
     dscp: u8,
     group_id: u64,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub enum RequestMsg {
     Start,
     Tunnel(TunnelMsg),
     Stop,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub enum ResponseMsg {
     Ok,
     Err(String)
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub enum Message {
     Request(RequestMsg),
     Response(ResponseMsg),

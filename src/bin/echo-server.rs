@@ -1,12 +1,13 @@
 extern crate env_logger;
 
-use rqst::quic::*;
+use rqst::{quic::*, vpn};
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc};
 use std::net::{SocketAddr, IpAddr, Ipv4Addr, Ipv6Addr};
+use anyhow::anyhow;
 
 #[tokio::main]
-async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
+async fn main() -> anyhow::Result<()> {
     env_logger::init();
 
     let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
@@ -67,103 +68,10 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         tokio::select! {
             Ok(conn) = quic.accept() => {
                 println!("Connection accepted: {}", conn.conn_handle);
-                let mut notify_shutdown_rx: broadcast::Receiver<()> = notify_shutdown.subscribe();
+                let notify_shutdown_rx = notify_shutdown.subscribe();
                 let shutdown_complete_tx1 = shutdown_complete_tx.clone();
                 tokio::spawn( async move {
-                    let _shutdown_complete_tx1 = shutdown_complete_tx1;
-
-                    println!("enter loop");
-                    let mut now = Instant::now();
-                    let mut bytes = 0;
-                    loop {
-                        let elapsed = Instant::now().duration_since(now);
-                        if elapsed >= Duration::from_secs(1) {
-                            if let Ok((front_len, queue_byte_size, queue_len)) = conn.recv_dgram_info().await {
-                                println!(
-                                    "front_len: {} bytes, queue_byte_size: {} bytes, queue_len: {} counts",
-                                    front_len.unwrap_or(0),
-                                    queue_byte_size,
-                                    queue_len
-                                );
-                                now = Instant::now();
-                            }
-                            println!("{:.3} Mbps", bytes as f64 * 8.0 / (1024.0 * 1024.0) / elapsed.as_secs_f64());
-                            bytes = 0;
-                        }
-                        tokio::select! {
-                            _ = conn.recv_dgram_ready() => {
-                                let ret = conn.recv_dgram_vectored(1).await;
-                                match ret {
-                                    Ok(bufs) => {
-                                        bytes += bufs.iter().map(|x| x.len()).sum::<usize>();
-                                    }
-                                    Err(e) => {
-                                        println!("recv_dgram: failed: {:?}", e);
-                                        break;
-                                    }
-                                }
-                            },
-                            readable = conn.recv_stream_ready(None) => {
-                                println!("readable: {:?}", readable);
-                            }
-                            res = conn.path_event() => {
-                                match res {
-                                    Ok(event) => {
-                                        match event {
-                                            quiche::PathEvent::New(local_addr, peer_addr) => {
-                                                println!("Seen new Path ({}, {})", local_addr, peer_addr);
-                                            },
-            
-                                            quiche::PathEvent::Validated(local_addr, peer_addr) => {
-                                                println!("Path ({}, {}) is now validated", local_addr, peer_addr);
-                                                conn.set_active(local_addr, peer_addr, true).await.ok();
-                                            }
-            
-                                            quiche::PathEvent::ReturnAvailable(local_addr, peer_addr) => {
-                                                println!("Path ({}, {})'s return is now available", local_addr, peer_addr);
-                                            }
-                                            
-                                            quiche::PathEvent::FailedValidation(local_addr, peer_addr) => {
-                                                println!("Path ({}, {}) failed validation", local_addr, peer_addr);
-                                            }
-            
-                                            quiche::PathEvent::Closed(local_addr, peer_addr, e, reason) => {
-                                                println!("Path ({}, {}) is now closed and unusable; err = {}, reason = {:?}",
-                                                    local_addr, peer_addr, e, reason);
-                                            }
-            
-                                            quiche::PathEvent::ReusedSourceConnectionId(cid_seq, old, new) => {
-                                                println!("Peer reused cid seq {} (initially {:?}) on {:?}",
-                                                    cid_seq, old, new);
-                                            }
-            
-                                            quiche::PathEvent::PeerMigrated(..) => {},
-            
-                                            quiche::PathEvent::PeerPathStatus(..) => {},
-            
-                                            quiche::PathEvent::InsertGroup(group_id, (local_addr, peer_addr)) => {
-                                                println!("Peer inserts path ({}, {}) into group {}",
-                                                    local_addr, peer_addr, group_id);
-                                            },
-            
-                                            quiche::PathEvent::RemoveGroup(..) => unreachable!(),
-                                        }
-                                    }
-                                    Err(e) => {
-                                        println!("path_event failed: {:?}", e);
-                                    }
-                                }
-                            },
-            
-                            _ = tokio::time::sleep(Duration::from_secs(0)) => {}
-                            _ = notify_shutdown_rx.recv() => {
-                                println!("leave loop");
-                                break;
-                            }
-                        }
-                    }
-                    conn.close().await.unwrap();
-                    println!("leave loop");
+                    process_client(conn, notify_shutdown_rx, shutdown_complete_tx1).await
                 });
             },
             _ = tokio::signal::ctrl_c() => {
@@ -175,5 +83,112 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     drop(quic);
     drop(shutdown_complete_tx);
     let _ = shutdown_complete_rx.recv().await;
+    Ok(())
+}
+
+async fn process_client(
+    conn: QuicConnectionHandle,
+    mut notify_shutdown: broadcast::Receiver<()>,
+    _shutdown_complete: mpsc::Sender<()>
+) -> anyhow::Result<()> {
+    println!("enter loop");
+    let mut ctrlmng = vpn::ControlManager::new(true);
+
+    let mut now = Instant::now();
+    let mut bytes = 0;
+    loop {
+        let elapsed = Instant::now().duration_since(now);
+        if elapsed >= Duration::from_secs(1) {
+            if let Ok((front_len, queue_byte_size, queue_len)) = conn.recv_dgram_info().await {
+                println!(
+                    "front_len: {} bytes, queue_byte_size: {} bytes, queue_len: {} counts",
+                    front_len.unwrap_or(0),
+                    queue_byte_size,
+                    queue_len
+                );
+                now = Instant::now();
+            }
+            println!("{:.3} Mbps", bytes as f64 * 8.0 / (1024.0 * 1024.0) / elapsed.as_secs_f64());
+            bytes = 0;
+        }
+        tokio::select! {
+            _ = conn.recv_dgram_ready() => {
+                let ret = conn.recv_dgram_vectored(1).await;
+                match ret {
+                    Ok(bufs) => {
+                        bytes += bufs.iter().map(|x| x.len()).sum::<usize>();
+                    }
+                    Err(e) => {
+                        println!("recv_dgram: failed: {:?}", e);
+                        break;
+                    }
+                }
+            },
+            readable = conn.recv_stream_ready(None) => {
+                let readable = readable.map_err(|e| anyhow!(e))?;
+                for stream_id in readable {
+                    if let Some((seq, msg)) = ctrlmng.recv_message(&conn, stream_id).await? {
+                        println!("seq={}, msg={:?}", seq, msg);
+                    }
+                }
+            }
+            res = conn.path_event() => {
+                match res {
+                    Ok(event) => {
+                        match event {
+                            quiche::PathEvent::New(local_addr, peer_addr) => {
+                                println!("Seen new Path ({}, {})", local_addr, peer_addr);
+                            },
+
+                            quiche::PathEvent::Validated(local_addr, peer_addr) => {
+                                println!("Path ({}, {}) is now validated", local_addr, peer_addr);
+                                conn.set_active(local_addr, peer_addr, true).await.ok();
+                            }
+
+                            quiche::PathEvent::ReturnAvailable(local_addr, peer_addr) => {
+                                println!("Path ({}, {})'s return is now available", local_addr, peer_addr);
+                            }
+                            
+                            quiche::PathEvent::FailedValidation(local_addr, peer_addr) => {
+                                println!("Path ({}, {}) failed validation", local_addr, peer_addr);
+                            }
+
+                            quiche::PathEvent::Closed(local_addr, peer_addr, e, reason) => {
+                                println!("Path ({}, {}) is now closed and unusable; err = {}, reason = {:?}",
+                                    local_addr, peer_addr, e, reason);
+                            }
+
+                            quiche::PathEvent::ReusedSourceConnectionId(cid_seq, old, new) => {
+                                println!("Peer reused cid seq {} (initially {:?}) on {:?}",
+                                    cid_seq, old, new);
+                            }
+
+                            quiche::PathEvent::PeerMigrated(..) => {},
+
+                            quiche::PathEvent::PeerPathStatus(..) => {},
+
+                            quiche::PathEvent::InsertGroup(group_id, (local_addr, peer_addr)) => {
+                                println!("Peer inserts path ({}, {}) into group {}",
+                                    local_addr, peer_addr, group_id);
+                            },
+
+                            quiche::PathEvent::RemoveGroup(..) => unreachable!(),
+                        }
+                    }
+                    Err(e) => {
+                        println!("path_event failed: {:?}", e);
+                    }
+                }
+            },
+
+            _ = tokio::time::sleep(Duration::from_secs(0)) => {}
+            _ = notify_shutdown.recv() => {
+                println!("leave loop");
+                break;
+            }
+        }
+    }
+    conn.close().await.unwrap();
+    println!("leave loop");
     Ok(())
 }
