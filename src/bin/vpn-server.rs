@@ -1,11 +1,18 @@
 use anyhow::{anyhow, Context};
 use flexi_logger::{detailed_format, FileSpec, Logger, WriteMode};
 use log::{error, info};
+#[cfg(windows)]
+use once_cell::sync::Lazy;
 use rqst::quic::*;
 use rqst::vpn;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
+#[cfg(windows)]
+use std::sync::Mutex;
 use tokio::sync::{broadcast, mpsc};
+
+#[cfg(windows)]
+static MATCHES: Lazy<Mutex<Option<clap::ArgMatches>>> = Lazy::new(|| Mutex::new(None));
 
 fn main() -> anyhow::Result<()> {
     let cert_default_path = std::env::current_exe()
@@ -97,6 +104,7 @@ fn main() -> anyhow::Result<()> {
         }
         #[cfg(windows)]
         Some(("run_as_service", _)) => {
+            MATCHES.lock().unwrap().replace(matches);
             if let Err(e) = vpn_server_service::run() {
                 eprintln!("{:?}", e);
             }
@@ -216,12 +224,18 @@ mod vpn_server_service {
             process_id: None,
         })?;
 
+        let matches = crate::MATCHES
+            .lock()
+            .unwrap()
+            .take()
+            .expect("MATCHES not set");
+
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .unwrap()
             .block_on(async {
-                let _ = crate::tokio_main(Some(notify_stop_rx), false, false, false).await;
+                let _ = crate::tokio_main(Some(notify_stop_rx), &matches).await;
             });
 
         status_handle.set_service_status(ServiceStatus {
