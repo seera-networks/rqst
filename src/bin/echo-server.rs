@@ -150,51 +150,46 @@ async fn process_client(
                 }
             }
             res = conn.path_event() => {
-                match res {
-                    Ok(event) => {
-                        match event {
-                            quiche::PathEvent::New(local_addr, peer_addr) => {
-                                println!("Seen new Path ({}, {})", local_addr, peer_addr);
-                            },
+                let event = res.map_err(|e| anyhow!(e))
+                    .context("path_event()")?;
+                match event {
+                    quiche::PathEvent::New(local_addr, peer_addr) => {
+                        info!("Seen new Path ({}, {})", local_addr, peer_addr);
+                    },
 
-                            quiche::PathEvent::Validated(local_addr, peer_addr) => {
-                                println!("Path ({}, {}) is now validated", local_addr, peer_addr);
-                                conn.set_active(local_addr, peer_addr, true).await.ok();
-                            }
-
-                            quiche::PathEvent::ReturnAvailable(local_addr, peer_addr) => {
-                                println!("Path ({}, {})'s return is now available", local_addr, peer_addr);
-                            }
-
-                            quiche::PathEvent::FailedValidation(local_addr, peer_addr) => {
-                                println!("Path ({}, {}) failed validation", local_addr, peer_addr);
-                            }
-
-                            quiche::PathEvent::Closed(local_addr, peer_addr, e, reason) => {
-                                println!("Path ({}, {}) is now closed and unusable; err = {}, reason = {:?}",
-                                    local_addr, peer_addr, e, reason);
-                            }
-
-                            quiche::PathEvent::ReusedSourceConnectionId(cid_seq, old, new) => {
-                                println!("Peer reused cid seq {} (initially {:?}) on {:?}",
-                                    cid_seq, old, new);
-                            }
-
-                            quiche::PathEvent::PeerMigrated(..) => {},
-
-                            quiche::PathEvent::PeerPathStatus(..) => {},
-
-                            quiche::PathEvent::InsertGroup(group_id, (local_addr, peer_addr)) => {
-                                println!("Peer inserts path ({}, {}) into group {}",
-                                    local_addr, peer_addr, group_id);
-                            },
-
-                            quiche::PathEvent::RemoveGroup(..) => unreachable!(),
-                        }
+                    quiche::PathEvent::Validated(local_addr, peer_addr) => {
+                        info!("Path ({}, {}) is now validated", local_addr, peer_addr);
+                        conn.set_active(local_addr, peer_addr, true).await.ok();
                     }
-                    Err(e) => {
-                        println!("path_event failed: {:?}", e);
+
+                    quiche::PathEvent::ReturnAvailable(local_addr, peer_addr) => {
+                        info!("Path ({}, {})'s return is now available", local_addr, peer_addr);
                     }
+
+                    quiche::PathEvent::FailedValidation(local_addr, peer_addr) => {
+                        info!("Path ({}, {}) failed validation", local_addr, peer_addr);
+                    }
+
+                    quiche::PathEvent::Closed(local_addr, peer_addr, e, reason) => {
+                        info!("Path ({}, {}) is now closed and unusable; err = {}, reason = {:?}",
+                            local_addr, peer_addr, e, reason);
+                    }
+
+                    quiche::PathEvent::ReusedSourceConnectionId(cid_seq, old, new) => {
+                        info!("Peer reused cid seq {} (initially {:?}) on {:?}",
+                            cid_seq, old, new);
+                    }
+
+                    quiche::PathEvent::PeerMigrated(..) => {},
+
+                    quiche::PathEvent::PeerPathStatus(..) => {},
+
+                    quiche::PathEvent::InsertGroup(group_id, (local_addr, peer_addr)) => {
+                        info!("Peer inserts path ({}, {}) into group {}",
+                            local_addr, peer_addr, group_id);
+                    },
+
+                    quiche::PathEvent::RemoveGroup(..) => unreachable!(),
                 }
             },
 

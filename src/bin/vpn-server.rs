@@ -10,6 +10,7 @@ use std::path::PathBuf;
 #[cfg(windows)]
 use std::sync::Mutex;
 use tokio::sync::{broadcast, mpsc};
+use tokio::task::JoinSet;
 
 #[cfg(windows)]
 static MATCHES: Lazy<Mutex<Option<clap::ArgMatches>>> = Lazy::new(|| Mutex::new(None));
@@ -365,13 +366,11 @@ async fn tokio_main(
         tokio::select! {
             Ok(conn) = quic.accept() => {
                 info!("Connection accepted: {}", conn.conn_handle);
-                tokio::spawn(vpn::transfer(
+                tokio::spawn(process_client(
                     conn,
-                    notify_shutdown.subscribe(),
                     notify_shutdown.subscribe(),
                     shutdown_complete_tx.clone(),
                     matches.is_present("pktlog"),
-                    false,
                     )
                 );
             }
@@ -388,5 +387,99 @@ async fn tokio_main(
     drop(quic);
     drop(shutdown_complete_tx);
     let _ = shutdown_complete_rx.recv().await;
+    Ok(())
+}
+
+async fn process_client(
+    conn: QuicConnectionHandle,
+    mut notify_shutdown_rx: broadcast::Receiver<()>,
+    shutdown_complete_tx: mpsc::Sender<()>,
+    enable_pktlog: bool,
+) -> anyhow::Result<()> {
+    let mut set = JoinSet::new();
+    let (notify_shutdown_tx, _) = broadcast::channel(1);
+
+    set.spawn(vpn::transfer(
+        conn.clone(),
+        notify_shutdown_tx.subscribe(),
+        notify_shutdown_tx.subscribe(),
+        shutdown_complete_tx.clone(),
+        enable_pktlog,
+        false,
+        )
+    );
+
+    info!("Enter loop for client");
+    loop {
+        tokio::select! {
+            res = conn.path_event() => {
+                let event = res.map_err(|e| anyhow!(e))
+                    .context("path_event()")?;
+                match event {
+                    quiche::PathEvent::New(local_addr, peer_addr) => {
+                        info!("Seen new Path ({}, {})", local_addr, peer_addr);
+                    },
+
+                    quiche::PathEvent::Validated(local_addr, peer_addr) => {
+                        info!("Path ({}, {}) is now validated", local_addr, peer_addr);
+                        conn.set_active(local_addr, peer_addr, true).await.ok();
+                    }
+
+                    quiche::PathEvent::ReturnAvailable(local_addr, peer_addr) => {
+                        info!("Path ({}, {})'s return is now available", local_addr, peer_addr);
+                    }
+
+                    quiche::PathEvent::FailedValidation(local_addr, peer_addr) => {
+                        info!("Path ({}, {}) failed validation", local_addr, peer_addr);
+                    }
+
+                    quiche::PathEvent::Closed(local_addr, peer_addr, e, reason) => {
+                        info!("Path ({}, {}) is now closed and unusable; err = {}, reason = {:?}",
+                            local_addr, peer_addr, e, reason);
+                    }
+
+                    quiche::PathEvent::ReusedSourceConnectionId(cid_seq, old, new) => {
+                        info!("Peer reused cid seq {} (initially {:?}) on {:?}",
+                            cid_seq, old, new);
+                    }
+
+                    quiche::PathEvent::PeerMigrated(..) => {},
+
+                    quiche::PathEvent::PeerPathStatus(..) => {},
+
+                    quiche::PathEvent::InsertGroup(group_id, (local_addr, peer_addr)) => {
+                        info!("Peer inserts path ({}, {}) into group {}",
+                            local_addr, peer_addr, group_id);
+                    },
+
+                    quiche::PathEvent::RemoveGroup(..) => unreachable!(),
+                }
+            },
+            res = set.join_next(), if !set.is_empty() => {
+                if let Some(res) = res {
+                    match res? {
+                        Ok(_) => {
+                            info!("subprocess_client() successfuly finish");
+                        }
+                        Err(e) => {
+                            info!("Error occured in subprocess_client(): {:?}", e);
+                        }
+                    }
+                }
+            }
+            _ = notify_shutdown_rx.recv() => {
+                info!("Shutdown requested");
+                drop(notify_shutdown_tx);
+                while let Some(res) = set.join_next().await {
+                    if let Err(e) = res? {
+                        error!("Error occured in process_client(): {:?}", e);
+                    }
+                }
+                break;
+            }
+
+        }
+    }
+    info!("Leave loop for client");
     Ok(())
 }
