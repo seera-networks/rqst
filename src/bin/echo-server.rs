@@ -119,8 +119,8 @@ async fn process_client(
 
     loop {
         tokio::select! {
-            res = conn.recv_stream_ready(None, None) => {
-            //res = conn.recv_stream_ready(None, Some((true, false, false, false))) => {
+            //res = conn.recv_stream_ready(None, None) => {
+            res = conn.recv_stream_ready(None, Some((true, false, false, false))) => {
                 let readable = res.map_err(|e| anyhow!(e))
                     .context("check stream's readness")?;
                 for stream_id in readable {

@@ -24,9 +24,11 @@ async-stream = "0.3.3"
 tokio-stream = "0.1.9"
 serde = "1.0"
 serde_json = "1.0"
+toml = "0.5.9"
 anyhow = "1.0"
 tokio-util = { version = "0.7.7", features = ["codec"] }
 etherparse = "0.13"
+ipnet = { version = "2", features = ["serde"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
