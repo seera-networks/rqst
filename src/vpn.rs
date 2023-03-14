@@ -7,8 +7,7 @@ use etherparse::{IpHeader, PacketHeaders};
 use pcap_file::pcap::PcapWriter;
 use serde::{Deserialize, Serialize};
 use socket2::Socket;
-use std::collections::BTreeMap;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet, HashMap};
 use std::fs::{File, OpenOptions};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
@@ -66,6 +65,16 @@ impl ControlManager {
             return Err(anyhow!("Sending Stop not allowed by server"));
         }
         let msg = serde_json::to_string(&RequestMsg::Stop).context("serialize message")?;
+        self.send_request(conn, &msg)
+            .await
+            .context("sending request")
+    }
+
+    pub async fn send_tunnel_request(&mut self, conn: &QuicConnectionHandle, dscp: u8, group_id: u64) -> anyhow::Result<u64> {
+        if self.is_server {
+            return Err(anyhow!("Sending Tunnel not allowed by server"));
+        }
+        let msg = serde_json::to_string(&RequestMsg::Tunnel(TunnelMsg { dscp, group_id })).context("serialize message")?;
         self.send_request(conn, &msg)
             .await
             .context("sending request")
@@ -221,27 +230,24 @@ impl ControlManager {
 pub struct PathManager {
     conn: QuicConnectionHandle,
     client_config: ClientConfig,
-    path_groups: BTreeMap<String, u64>,
     peer_addr: Option<SocketAddr>,
     local_addrs: BTreeMap<SocketAddr, HashSet<u64>>,
+    pub names_to_path_groups: BTreeMap<String, u64>,
 }
 
 impl PathManager {
-    pub fn new(conn: QuicConnectionHandle, config_toml: &str) -> anyhow::Result<Self> {
-        let client_config: ClientConfig =
-            toml::from_str(config_toml).context("parse client config")?;
-
-        let mut path_groups = BTreeMap::new();
+    pub fn new(conn: QuicConnectionHandle, client_config: ClientConfig) -> Self {
+        let mut names_to_path_groups = BTreeMap::new();
         for (i, path_group) in client_config.path_groups.iter().enumerate() {
-            path_groups.insert(path_group.name().to_string(), i as u64 + 1);
+            names_to_path_groups.insert(path_group.name().to_string(), i as u64 + 1);
         }
-        Ok(PathManager {
+        PathManager {
             conn,
             client_config,
-            path_groups,
             peer_addr: None,
             local_addrs: BTreeMap::new(),
-        })
+            names_to_path_groups,
+        }
     }
 
     pub fn register_local_addr(
@@ -272,10 +278,10 @@ impl PathManager {
             };
             if let Some(name) = name {
                 let group_id = self
-                    .path_groups
+                    .names_to_path_groups
                     .get(&name)
                     .copied()
-                    .expect("old path_groups?");
+                    .expect("old names_to_path_groups?");
                 group_ids.insert(group_id);
             }
         }
@@ -360,6 +366,53 @@ impl PathManager {
             count = count.saturating_add(1);
         }
         Ok(count)
+    }
+}
+
+pub struct TunnelManager {
+    conn: QuicConnectionHandle,
+    tunnels: HashMap<u8, u64>,
+}
+
+impl TunnelManager {
+    pub fn new(conn: QuicConnectionHandle, tunnels: HashMap<u8, u64>) -> Self {
+        TunnelManager {
+            conn,
+            tunnels,
+        }
+    }
+
+    pub fn insert(&mut self, dscp: u8, group_id: u64) {
+        self.tunnels.insert(dscp, group_id);
+    }
+
+    pub fn remove(&mut self, dscp: u8) -> bool {
+        self.tunnels.remove(&dscp).is_some()
+    }
+
+    pub async fn available(&self) -> anyhow::Result<HashMap<u8, u64>> {
+        let mut active = HashSet::new();
+        self.conn
+            .path_stats().await
+            .map_err(|e| anyhow!(e))
+            .context("path_stats()")?
+            .iter()
+            .for_each(|stats| {
+                for group_id in &stats.group_ids {
+                    active.insert(*group_id);
+                }
+            });
+
+        let mut tunnels = HashMap::new();
+        self.tunnels
+            .iter()
+            .filter(|(_, group_id)| {
+                active.contains(*group_id)
+            })
+            .for_each(|(dscp, group_id)| {
+                tunnels.insert(*dscp, *group_id);
+            });
+        Ok(tunnels)
     }
 }
 

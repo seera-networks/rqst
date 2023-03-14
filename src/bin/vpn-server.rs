@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinSet;
+use std::collections::HashMap;
 
 #[cfg(windows)]
 static MATCHES: Lazy<Mutex<Option<clap::ArgMatches>>> = Lazy::new(|| Mutex::new(None));
@@ -397,6 +398,7 @@ async fn process_client(
     enable_pktlog: bool,
 ) -> anyhow::Result<()> {
     let mut ctrlmng = ControlManager::new(true);
+    let mut tunnelmng = TunnelManager::new(conn.clone(), HashMap::new());
     let mut notify_shutdown_vpn = None;
     let mut set = JoinSet::new();
 
@@ -437,6 +439,13 @@ async fn process_client(
                                     .context("send response err for stop")?;
                             }
                         }
+                        Some((seq, RequestMsg::Tunnel(TunnelMsg { dscp, group_id }))) => {
+                            info!("Recv tunnel request");
+                            tunnelmng.insert(dscp, group_id);
+                            ctrlmng.send_response_ok(&conn, seq).await
+                                .context("send response ok for tunnel")?;
+                        }
+
                         _ => {}
                     }
                 }

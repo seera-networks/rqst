@@ -85,9 +85,9 @@ impl PathGroup {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Tunnel {
-    dscp: u8,
+    pub dscp: u8,
     #[serde(rename = "path-group")]
-    path_group: String,
+    pub path_group: String,
 }
 
 mod test {

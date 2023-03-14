@@ -1,8 +1,10 @@
 use anyhow::{anyhow, Context};
 use flexi_logger::{detailed_format, FileSpec, Logger, WriteMode};
 use log::{error, info};
+use rqst::config::*;
 use rqst::quic::*;
 use rqst::vpn::*;
+use std::collections::HashMap;
 use std::env;
 use std::io::prelude::*;
 use std::path::PathBuf;
@@ -173,6 +175,8 @@ async fn do_service(matches: &clap::ArgMatches) -> anyhow::Result<()> {
     let mut config_toml = String::new();
     file.read_to_string(&mut config_toml)
         .context("read from toml file")?;
+    let client_config: ClientConfig =
+        toml::from_str(&config_toml).context("parse client config")?;
 
     let cpus = num_cpus::get();
     info!("logical cores: {}", cpus);
@@ -205,7 +209,7 @@ async fn do_service(matches: &clap::ArgMatches) -> anyhow::Result<()> {
     };
 
     let mut set = JoinSet::new();
-    let mut pathmng = PathManager::new(conn.clone(), &config_toml).context("initialize PathManager")?;
+    let mut pathmng = PathManager::new(conn.clone(), client_config.clone());
 
     let paths = conn
         .path_stats()
@@ -220,18 +224,68 @@ async fn do_service(matches: &clap::ArgMatches) -> anyhow::Result<()> {
     pathmng.register_local_addr(local_addr, false);
     pathmng.register_peer_addr(peer_addr);
 
-    pathmng.set_group(local_addr).await
-        .context("insert path into a group")?;
+    pathmng
+        .set_group(local_addr)
+        .await
+        .context("insert path into group")?;
 
-    local_addr.set_port(local_addr.port() + 1);
+    let mut tunnels = HashMap::new();
 
-    pathmng.register_local_addr(local_addr, true);
+    client_config
+        .tunnels
+        .iter()
+        .filter_map(|tunnel| {
+            if let Some(group_id) = pathmng.names_to_path_groups.get(&tunnel.path_group) {
+                Some((tunnel.dscp, *group_id))
+            } else {
+                None
+            }
+        })
+        .for_each(|(dscp, group_id)| {
+            tunnels.insert(dscp, group_id);
+        });
 
-    pathmng.probe().await
-        .context("probing new path")?;
+    let mut tunnelmng = TunnelManager::new(conn.clone(), tunnels.clone());
+
+    let available = tunnelmng
+        .available()
+        .await
+        .context("get available tunnels")?;
+
+    info!("tunnels: {:?}, available: {:?}", tunnels, available);
+
+    {
+        local_addr.set_port(local_addr.port() + 1);
+
+        pathmng.register_local_addr(local_addr, true);
+
+        pathmng.probe().await.context("probing new path")?;
+    }
 
     let mut ctrlmng = ControlManager::new(false);
     let mut running_vpn = false;
+
+    for (dscp, group_id) in &tunnels {
+        notify_tunnel(&conn,
+            &mut ctrlmng,
+            *dscp,
+            *group_id
+        )
+            .await
+            .context("notify tunnel")?;
+    }
+    if !running_vpn {
+        start_vpn(&conn,
+            &mut ctrlmng,
+            &mut set,
+            &notify_shutdown_tx,
+            shutdown_complete_tx.clone(),
+            matches.is_present("pktlog")
+        )
+            .await
+            .context("start vpn")?;
+        running_vpn = true;
+    }
 
     loop {
         tokio::select! {
@@ -249,20 +303,8 @@ async fn do_service(matches: &clap::ArgMatches) -> anyhow::Result<()> {
                     quiche::PathEvent::ReturnAvailable(local_addr, peer_addr) => {
                         info!("Path ({}, {})'s return is now available", local_addr, peer_addr);
                         pathmng.set_group(local_addr).await
-                            .context("insert path into a group")?;
-                
-                        if !running_vpn {
-                            start_vpn(&conn,
-                                &mut ctrlmng,
-                                &mut set,
-                                &notify_shutdown_tx,
-                                shutdown_complete_tx.clone(),
-                                matches.is_present("pktlog")
-                            )
-                                .await
-                                .context("start vpn")?;
-                            running_vpn = true;
-                        }
+                            .context("insert path into group")?;
+
                     }
 
                     quiche::PathEvent::FailedValidation(local_addr, peer_addr) => {
@@ -342,6 +384,31 @@ async fn start_vpn(
         }
         ResponseMsg::Err(reason) => {
             error!("Cannot start VPN service: {}", reason);
+        }
+    }
+    Ok(())
+}
+
+async fn notify_tunnel(
+    conn: &QuicConnectionHandle,
+    ctrlmng: &mut ControlManager,
+    dscp: u8,
+    group_id: u64
+) -> anyhow::Result<()> {
+    let seq = ctrlmng.send_tunnel_request(&conn, dscp, group_id)
+        .await
+        .context("sending tunnel request")?;
+    info!("Notify tunnel: dscp={}, group_id={}", dscp, group_id);
+    match ctrlmng
+        .recv_response(&conn, seq)
+        .await
+        .context("recv response")?
+    {
+        ResponseMsg::Ok => {
+            info!("Tunnel notified successfuly");
+        }
+        ResponseMsg::Err(reason) => {
+            error!("Cannot notify tunnel: {}", reason);
         }
     }
     Ok(())
