@@ -245,14 +245,7 @@ async fn do_service(matches: &clap::ArgMatches) -> anyhow::Result<()> {
             tunnels.insert(dscp, group_id);
         });
 
-    let mut tunnelmng = TunnelManager::new(conn.clone(), tunnels.clone());
-
-    let available = tunnelmng
-        .available()
-        .await
-        .context("get available tunnels")?;
-
-    info!("tunnels: {:?}, available: {:?}", tunnels, available);
+    let tunnelmng = TunnelManager::new(conn.clone(), tunnels.clone());
 
     {
         local_addr.set_port(local_addr.port() + 1);
@@ -274,6 +267,7 @@ async fn do_service(matches: &clap::ArgMatches) -> anyhow::Result<()> {
             .await
             .context("notify tunnel")?;
     }
+
     if !running_vpn {
         start_vpn(&conn,
             &mut ctrlmng,
@@ -304,7 +298,11 @@ async fn do_service(matches: &clap::ArgMatches) -> anyhow::Result<()> {
                         info!("Path ({}, {})'s return is now available", local_addr, peer_addr);
                         pathmng.set_group(local_addr).await
                             .context("insert path into group")?;
-
+                        let available = tunnelmng
+                            .available()
+                            .await
+                            .context("get available tunnels")?;
+                        info!("tunnels: {:?}, available: {:?}", tunnels, available);                
                     }
 
                     quiche::PathEvent::FailedValidation(local_addr, peer_addr) => {

@@ -489,6 +489,11 @@ async fn process_client(
                     quiche::PathEvent::InsertGroup(group_id, (local_addr, peer_addr)) => {
                         info!("Peer inserts path ({}, {}) into group {}",
                             local_addr, peer_addr, group_id);
+                        let available = tunnelmng
+                            .available()
+                            .await
+                            .context("get available tunnels")?;
+                        info!("available: {:?}", available);
                     },
 
                     quiche::PathEvent::RemoveGroup(..) => unreachable!(),
