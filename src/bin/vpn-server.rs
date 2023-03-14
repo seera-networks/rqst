@@ -399,6 +399,7 @@ async fn process_client(
 ) -> anyhow::Result<()> {
     let mut ctrlmng = ControlManager::new(true);
     let mut tunnelmng = TunnelManager::new(conn.clone(), HashMap::new());
+    let (notify_tunnel_tx, _) = broadcast::channel::<HashMap<u8, u64>>(100);
     let mut notify_shutdown_vpn = None;
     let mut set = JoinSet::new();
 
@@ -419,6 +420,8 @@ async fn process_client(
                                 conn.clone(),
                                 notify_shutdown_tx.subscribe(),
                                 notify_shutdown_tx.subscribe(),
+                                notify_tunnel_tx.subscribe(),
+                                notify_tunnel_tx.subscribe(),
                                 shutdown_complete_tx.clone(),
                                 enable_pktlog,
                                 false,
@@ -493,7 +496,8 @@ async fn process_client(
                             .available()
                             .await
                             .context("get available tunnels")?;
-                        info!("available: {:?}", available);
+                        notify_tunnel_tx.send(available)
+                            .context("notify tunnel")?;
                     },
 
                     quiche::PathEvent::RemoveGroup(..) => unreachable!(),

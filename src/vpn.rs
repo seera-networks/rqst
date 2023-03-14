@@ -7,7 +7,7 @@ use etherparse::{IpHeader, PacketHeaders};
 use pcap_file::pcap::PcapWriter;
 use serde::{Deserialize, Serialize};
 use socket2::Socket;
-use std::collections::{BTreeMap, HashSet, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
@@ -70,11 +70,17 @@ impl ControlManager {
             .context("sending request")
     }
 
-    pub async fn send_tunnel_request(&mut self, conn: &QuicConnectionHandle, dscp: u8, group_id: u64) -> anyhow::Result<u64> {
+    pub async fn send_tunnel_request(
+        &mut self,
+        conn: &QuicConnectionHandle,
+        dscp: u8,
+        group_id: u64,
+    ) -> anyhow::Result<u64> {
         if self.is_server {
             return Err(anyhow!("Sending Tunnel not allowed by server"));
         }
-        let msg = serde_json::to_string(&RequestMsg::Tunnel(TunnelMsg { dscp, group_id })).context("serialize message")?;
+        let msg = serde_json::to_string(&RequestMsg::Tunnel(TunnelMsg { dscp, group_id }))
+            .context("serialize message")?;
         self.send_request(conn, &msg)
             .await
             .context("sending request")
@@ -250,11 +256,7 @@ impl PathManager {
         }
     }
 
-    pub fn register_local_addr(
-        &mut self,
-        local_addr: SocketAddr,
-        metered: bool,
-    ) -> bool {
+    pub fn register_local_addr(&mut self, local_addr: SocketAddr, metered: bool) -> bool {
         if self.local_addrs.contains_key(&local_addr) {
             return false;
         }
@@ -289,10 +291,7 @@ impl PathManager {
         true
     }
 
-    pub fn register_peer_addr(
-        &mut self,
-        peer_addr: SocketAddr,
-    ) -> bool {
+    pub fn register_peer_addr(&mut self, peer_addr: SocketAddr) -> bool {
         if self.peer_addr.is_some() {
             return false;
         }
@@ -307,19 +306,20 @@ impl PathManager {
 
         let peer_addr = self.peer_addr.as_ref().unwrap();
 
-        let paths = self.local_addrs
+        let paths = self
+            .local_addrs
             .keys()
-            .map(|local_addr| {
-                (*local_addr, peer_addr.clone())
-            })
+            .map(|local_addr| (*local_addr, peer_addr.clone()))
             .collect::<HashSet<(SocketAddr, SocketAddr)>>();
 
-        let paths1 = self.conn
-            .path_stats().await
+        let paths1 = self
+            .conn
+            .path_stats()
+            .await
             .map_err(|e| anyhow!(e))
             .context("path_stats()")?
             .into_iter()
-            .filter_map(|stats|{
+            .filter_map(|stats| {
                 if stats.validation_state != quiche::PathValidationState::Unknown {
                     Some((stats.local_addr, stats.peer_addr))
                 } else {
@@ -330,8 +330,10 @@ impl PathManager {
 
         let mut count: usize = 0;
         for (local_addr, peer_addr) in paths.difference(&paths1) {
-            let seq = self.conn
-                .probe_path(*local_addr, *peer_addr).await
+            let seq = self
+                .conn
+                .probe_path(*local_addr, *peer_addr)
+                .await
                 .map_err(|e| anyhow!(e))
                 .context("probe_path()")?;
             info!("Probing ({}, {}) with seq={}", local_addr, peer_addr, seq);
@@ -347,11 +349,10 @@ impl PathManager {
 
         let peer_addr = self.peer_addr.as_ref().unwrap();
 
-        let group_ids = self.local_addrs
+        let group_ids = self
+            .local_addrs
             .iter()
-            .find(|(local_addr1, _)| {
-                **local_addr1 == local_addr
-            })
+            .find(|(local_addr1, _)| **local_addr1 == local_addr)
             .map(|(_, group_ids)| group_ids)
             .ok_or(anyhow!("local_addr"))?;
 
@@ -359,10 +360,14 @@ impl PathManager {
 
         for group_id in group_ids {
             self.conn
-                .insert_group(local_addr, *peer_addr, *group_id).await
+                .insert_group(local_addr, *peer_addr, *group_id)
+                .await
                 .map_err(|e| anyhow!(e))
                 .context("insert_group()")?;
-            info!("Inserting ({}, {}) into group {}", local_addr, *peer_addr, *group_id);
+            info!(
+                "Inserting ({}, {}) into group {}",
+                local_addr, *peer_addr, *group_id
+            );
             count = count.saturating_add(1);
         }
         Ok(count)
@@ -376,10 +381,7 @@ pub struct TunnelManager {
 
 impl TunnelManager {
     pub fn new(conn: QuicConnectionHandle, tunnels: HashMap<u8, u64>) -> Self {
-        TunnelManager {
-            conn,
-            tunnels,
-        }
+        TunnelManager { conn, tunnels }
     }
 
     pub fn insert(&mut self, dscp: u8, group_id: u64) {
@@ -393,7 +395,8 @@ impl TunnelManager {
     pub async fn available(&self) -> anyhow::Result<HashMap<u8, u64>> {
         let mut active = HashSet::new();
         self.conn
-            .path_stats().await
+            .path_stats()
+            .await
             .map_err(|e| anyhow!(e))
             .context("path_stats()")?
             .iter()
@@ -406,9 +409,7 @@ impl TunnelManager {
         let mut tunnels = HashMap::new();
         self.tunnels
             .iter()
-            .filter(|(_, group_id)| {
-                active.contains(*group_id)
-            })
+            .filter(|(_, group_id)| active.contains(*group_id))
             .for_each(|(dscp, group_id)| {
                 tunnels.insert(*dscp, *group_id);
             });
@@ -420,6 +421,8 @@ pub async fn transfer(
     quic: QuicConnectionHandle,
     notify_shutdown: broadcast::Receiver<()>,
     notify_shutdown1: broadcast::Receiver<()>,
+    notify_tunnel_rx: broadcast::Receiver<HashMap<u8, u64>>,
+    notify_tunnel_rx1: broadcast::Receiver<HashMap<u8, u64>>,
     shutdown_complete: mpsc::Sender<()>,
     enable_pktlog: bool,
     show_stats: bool,
@@ -457,7 +460,15 @@ pub async fn transfer(
         let pcap_writer1 = pcap_writer.clone();
         let shutdown_complete1 = shutdown_complete.clone();
         let mut task = tokio::spawn(async move {
-            remote_to_local(quic, tap1, pcap_writer, notify_shutdown, shutdown_complete).await;
+            remote_to_local(
+                quic,
+                tap1,
+                pcap_writer,
+                notify_shutdown,
+                notify_tunnel_rx,
+                shutdown_complete,
+            )
+            .await;
         });
         let mut task1 = tokio::spawn(async move {
             local_to_remote(
@@ -465,6 +476,7 @@ pub async fn transfer(
                 tap2,
                 pcap_writer1,
                 notify_shutdown1,
+                notify_tunnel_rx1,
                 shutdown_complete1,
             )
             .await;
@@ -518,8 +530,10 @@ async fn remote_to_local(
     tap: Arc<Tap>,
     pcap_writer: Option<Arc<Mutex<PcapWriter<File>>>>,
     mut notify_shutdown: broadcast::Receiver<()>,
+    mut notify_tunnel_rx: broadcast::Receiver<HashMap<u8, u64>>,
     _shutdown_complete: mpsc::Sender<()>,
-) {
+) -> anyhow::Result<()> {
+    let mut tunnels = None;
     'main: loop {
         tokio::select! {
             _ = quic.recv_dgram_ready() => {
@@ -537,6 +551,31 @@ async fn remote_to_local(
                                     pcap_writer.write(ts_sec, ts_nsec, &buf[..], orig_len).unwrap();
                                 }
                             }
+
+                            /*
+                            let frame = PacketHeaders::from_ethernet_slice(&buf[..])
+                                .context("parse ether frame")?;
+                            match frame.ip {
+                                Some(IpHeader::Version4(hdr, _)) => {
+                                    match hdr.differentiated_services_code_point {
+                                        40 => {
+                                            info!("Zoom Video");
+                                        }
+                                        56 => {
+                                            info!("Zoom Audio");
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                                Some(IpHeader::Version6(hdr, _)) => {
+                                    if hdr.traffic_class != 0 {
+                                        info!("{:?}", hdr);
+                                    }
+                                }
+                                _ => {}
+                            }
+                            */
+
                             match tap.write(&buf[..]).await {
                                 Ok(n) => {
                                     trace!("Write packet {} bytes", n);
@@ -554,11 +593,16 @@ async fn remote_to_local(
                     }
                 }
             },
+            res = notify_tunnel_rx.recv() => {
+                tunnels.replace(res?);
+                info!("{:?} notified", tunnels);
+            }
             _ = notify_shutdown.recv() => {
                 break 'main;
             },
         }
     }
+    Ok(())
 }
 
 async fn local_to_remote(
@@ -566,8 +610,10 @@ async fn local_to_remote(
     tap: Arc<Tap>,
     pcap_writer: Option<Arc<Mutex<PcapWriter<File>>>>,
     mut notify_shutdown: broadcast::Receiver<()>,
+    mut notify_tunnel_rx: broadcast::Receiver<HashMap<u8, u64>>,
     _shutdown_complete: mpsc::Sender<()>,
 ) -> anyhow::Result<()> {
+    let mut tunnels: Option<HashMap<u8, u64>> = None;
     'main: loop {
         let mut buf = BytesMut::with_capacity(1350);
         buf.resize(1350, 0);
@@ -589,26 +635,34 @@ async fn local_to_remote(
                         let buf = buf.freeze();
                         let frame = PacketHeaders::from_ethernet_slice(&buf[..])
                             .context("parse ether frame")?;
-                        match frame.ip {
+                        let group_id = match frame.ip {
                             Some(IpHeader::Version4(hdr, _)) => {
+                                tunnels.as_ref().and_then(|tunnels| {
+                                    tunnels.get(&hdr.differentiated_services_code_point).cloned()
+                                })
+                                /*
                                 match hdr.differentiated_services_code_point {
                                     40 => {
-                                        info!("Zoom Video");
+                                        info!("Zoom Video: {:?}", group_id);
                                     }
                                     56 => {
-                                        info!("Zoom Audio");
+                                        info!("Zoom Audio: {:?}", group_id);
                                     }
                                     _ => {}
                                 }
+                                */
                             }
+                            /*
                             Some(IpHeader::Version6(hdr, _)) => {
                                 if hdr.traffic_class != 0 {
                                     info!("{:?}", hdr);
                                 }
                             }
-                            _ => {}
-                        }
-                        match quic.send_dgram(&buf, 0).await {
+                            */
+                            _ => { None }
+                        };
+                        let group_id = group_id.unwrap_or(0);
+                        match quic.send_dgram(&buf, group_id).await {
                             Ok(_) => {
                                 trace!("Send dgram {} bytes", n);
                             }
@@ -624,6 +678,10 @@ async fn local_to_remote(
                     }
                 }
             },
+            res = notify_tunnel_rx.recv() => {
+                tunnels.replace(res?);
+                info!("{:?} notified", tunnels);
+            }
             _ = notify_shutdown.recv() => {
                 break 'main;
             },

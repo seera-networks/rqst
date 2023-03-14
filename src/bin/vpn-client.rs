@@ -268,11 +268,14 @@ async fn do_service(matches: &clap::ArgMatches) -> anyhow::Result<()> {
             .context("notify tunnel")?;
     }
 
+    let (notify_tunnel_tx, _) = broadcast::channel::<HashMap<u8, u64>>(100);
+
     if !running_vpn {
         start_vpn(&conn,
             &mut ctrlmng,
             &mut set,
             &notify_shutdown_tx,
+            &notify_tunnel_tx,
             shutdown_complete_tx.clone(),
             matches.is_present("pktlog")
         )
@@ -302,7 +305,8 @@ async fn do_service(matches: &clap::ArgMatches) -> anyhow::Result<()> {
                             .available()
                             .await
                             .context("get available tunnels")?;
-                        info!("tunnels: {:?}, available: {:?}", tunnels, available);                
+                        notify_tunnel_tx.send(available)
+                            .context("notify tunnel")?;
                     }
 
                     quiche::PathEvent::FailedValidation(local_addr, peer_addr) => {
@@ -356,6 +360,7 @@ async fn start_vpn(
     ctrlmng: &mut ControlManager,
     set: &mut JoinSet<anyhow::Result<()>>,
     notify_shutdown_tx: &broadcast::Sender<()>,
+    notify_tunnel_tx: &broadcast::Sender<HashMap<u8, u64>>,
     shutdown_complete_tx: mpsc::Sender<()>,
     enable_pktlog: bool,
 ) -> anyhow::Result<()> {
@@ -375,6 +380,8 @@ async fn start_vpn(
                 conn.clone(),
                 notify_shutdown_tx.subscribe(),
                 notify_shutdown_tx.subscribe(),
+                notify_tunnel_tx.subscribe(),
+                notify_tunnel_tx.subscribe(),
                 shutdown_complete_tx,
                 enable_pktlog,
                 false,
