@@ -4,7 +4,7 @@ use ipnet::Ipv4Net;
 use serde::{Deserialize, Serialize};
 
 /// Configuration file template
-pub const CONFIG_TEMPLATE: &str = r#"## Configuration for rqst VPN
+pub const CLIENT_CONFIG_TEMPLATE: &str = r#"## Configuration for rqst VPN client
 
 ## Path groups
 [[path-groups]]
@@ -33,7 +33,7 @@ fn default_ipv4net() -> Ipv4Net {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Config {
+pub struct ClientConfig {
     #[serde(rename = "path-groups" ,default)]
     pub path_groups: Vec<PathGroup>,
 
@@ -41,23 +41,12 @@ pub struct Config {
     pub tunnels: Vec<Tunnel>,
 }
 
-/*
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            path_groups: Vec::new(),
-            tunnels: Vec::new(),
-        }
-    }
-}
-*/
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Ipv4NetPathGroup {
     name: String,
     #[serde(default = "default_ipv4net")]
-    ipnet: Ipv4Net,
+    pub ipnet: Ipv4Net,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -83,6 +72,16 @@ pub enum PathGroup {
     IfType(IfTypePathGroup),
 }
 
+impl PathGroup {
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Ipv4Net(Ipv4NetPathGroup { name, ..}) => name,
+            Self::IfType(IfTypePathGroup::Metred { name }) => name,
+            Self::IfType(IfTypePathGroup::NotMetred { name }) => name,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Tunnel {
@@ -94,7 +93,7 @@ pub struct Tunnel {
 mod test {
     use super::*;
 
-    const CONFIG: &str = r#"
+    const CLIENT_CONFIG: &str = r#"
         [[path-groups]]
         kind = "ipv4net"
         name = "localnet"
@@ -113,8 +112,8 @@ mod test {
     "#;
 
     #[test]
-    fn values() {
-        let cfg: Config = toml::from_str(CONFIG).unwrap();
+    fn client_config() {
+        let cfg: ClientConfig = toml::from_str(CLIENT_CONFIG).unwrap();
 
         assert_eq!(
             cfg.path_groups,

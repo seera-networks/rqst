@@ -1,16 +1,20 @@
+use crate::config::*;
 use crate::quic::*;
 use crate::tap::Tap;
 use anyhow::{anyhow, Context};
 use bytes::{BufMut, BytesMut};
+use etherparse::{IpHeader, PacketHeaders};
 use pcap_file::pcap::PcapWriter;
 use serde::{Deserialize, Serialize};
-use std::collections::{btree_map, BTreeMap};
+use socket2::Socket;
+use std::collections::BTreeMap;
+use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 use tokio::sync::{broadcast, mpsc};
 use tokio::time::sleep;
-use etherparse::{PacketHeaders, IpHeader, Ipv4Header, Ipv6Header};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TunnelMsg {
@@ -50,10 +54,10 @@ impl ControlManager {
         if self.is_server {
             return Err(anyhow!("Sending Start not allowed by server"));
         }
-        let msg = serde_json::to_string(&RequestMsg::Start)
-            .context("serialize message")?;
+        let msg = serde_json::to_string(&RequestMsg::Start).context("serialize message")?;
 
-        self.send_request(conn, &msg).await
+        self.send_request(conn, &msg)
+            .await
             .context("sending request")
     }
 
@@ -61,9 +65,9 @@ impl ControlManager {
         if self.is_server {
             return Err(anyhow!("Sending Stop not allowed by server"));
         }
-        let msg = serde_json::to_string(&RequestMsg::Stop)
-            .context("serialize message")?;
-        self.send_request(conn, &msg).await
+        let msg = serde_json::to_string(&RequestMsg::Stop).context("serialize message")?;
+        self.send_request(conn, &msg)
+            .await
             .context("sending request")
     }
 
@@ -91,16 +95,16 @@ impl ControlManager {
 
         Ok(seq)
     }
-    
+
     pub async fn send_response_ok(
         &self,
         conn: &QuicConnectionHandle,
-        seq: u64
+        seq: u64,
     ) -> anyhow::Result<()> {
-        let msg = serde_json::to_string(&ResponseMsg::Ok)
-            .context("serialize message")?;
+        let msg = serde_json::to_string(&ResponseMsg::Ok).context("serialize message")?;
 
-        self.send_response(conn, seq, &msg).await
+        self.send_response(conn, seq, &msg)
+            .await
             .context("sending response")
     }
 
@@ -113,7 +117,8 @@ impl ControlManager {
         let msg = serde_json::to_string(&ResponseMsg::Err(reason.to_string()))
             .context("serialize message")?;
 
-        self.send_response(conn, seq, &msg).await
+        self.send_response(conn, seq, &msg)
+            .await
             .context("sending response")
     }
 
@@ -165,14 +170,13 @@ impl ControlManager {
             .with_context(|| format!("recv_stream() for {} stream", stream_id))?
             .ok_or(anyhow!("Not readable stream"))?;
 
-        let storage = self.request_buf
-            .entry(seq)
-            .or_insert(Vec::new());
+        let storage = self.request_buf.entry(seq).or_insert(Vec::new());
 
         storage.put(buf);
 
         if fin {
-            let msg: RequestMsg = serde_json::from_slice(&storage[..]).context("deserialize message")?;
+            let msg: RequestMsg =
+                serde_json::from_slice(&storage[..]).context("deserialize message")?;
             self.request_buf.remove(&seq);
             Ok(Some((seq, msg)))
         } else {
@@ -182,7 +186,7 @@ impl ControlManager {
 
     pub async fn recv_response(
         &mut self,
-        quic: &QuicConnectionHandle,
+        conn: &QuicConnectionHandle,
         seq: u64,
     ) -> anyhow::Result<ResponseMsg> {
         let stream_id = if !self.is_server {
@@ -196,7 +200,7 @@ impl ControlManager {
         let mut storage = Vec::new();
 
         loop {
-            let (buf, fin) = quic
+            let (buf, fin) = conn
                 .recv_stream(stream_id)
                 .await
                 .map_err(|e| anyhow!(e))
@@ -206,10 +210,156 @@ impl ControlManager {
             storage.put(buf);
 
             if fin {
-                let msg: ResponseMsg = serde_json::from_slice(&storage[..]).context("deserialize message")?;
+                let msg: ResponseMsg =
+                    serde_json::from_slice(&storage[..]).context("deserialize message")?;
                 return Ok(msg);
             }
         }
+    }
+}
+
+pub struct PathManager {
+    conn: QuicConnectionHandle,
+    client_config: ClientConfig,
+    path_groups: BTreeMap<String, u64>,
+    peer_addr: Option<SocketAddr>,
+    local_addrs: BTreeMap<SocketAddr, HashSet<u64>>,
+}
+
+impl PathManager {
+    pub fn new(conn: QuicConnectionHandle, config_toml: &str) -> anyhow::Result<Self> {
+        let client_config: ClientConfig =
+            toml::from_str(config_toml).context("parse client config")?;
+
+        let mut path_groups = BTreeMap::new();
+        for (i, path_group) in client_config.path_groups.iter().enumerate() {
+            path_groups.insert(path_group.name().to_string(), i as u64 + 1);
+        }
+        Ok(PathManager {
+            conn,
+            client_config,
+            path_groups,
+            peer_addr: None,
+            local_addrs: BTreeMap::new(),
+        })
+    }
+
+    pub fn register_local_addr(
+        &mut self,
+        local_addr: SocketAddr,
+        metered: bool,
+    ) -> bool {
+        if self.local_addrs.contains_key(&local_addr) {
+            return false;
+        }
+        let mut group_ids = HashSet::new();
+        for path_group in &self.client_config.path_groups {
+            let name = match (path_group, local_addr.ip(), metered) {
+                (PathGroup::Ipv4Net(Ipv4NetPathGroup { ipnet, .. }), IpAddr::V4(ipaddr), _) => {
+                    if ipnet.contains(&ipaddr) {
+                        Some(path_group.name().to_string())
+                    } else {
+                        None
+                    }
+                }
+                (PathGroup::IfType(IfTypePathGroup::Metred { .. }), _, true) => {
+                    Some(path_group.name().to_string())
+                }
+                (PathGroup::IfType(IfTypePathGroup::NotMetred { .. }), _, false) => {
+                    Some(path_group.name().to_string())
+                }
+                _ => None,
+            };
+            if let Some(name) = name {
+                let group_id = self
+                    .path_groups
+                    .get(&name)
+                    .copied()
+                    .expect("old path_groups?");
+                group_ids.insert(group_id);
+            }
+        }
+        self.local_addrs.insert(local_addr, group_ids);
+        true
+    }
+
+    pub fn register_peer_addr(
+        &mut self,
+        peer_addr: SocketAddr,
+    ) -> bool {
+        if self.peer_addr.is_some() {
+            return false;
+        }
+        self.peer_addr = Some(peer_addr);
+        true
+    }
+
+    pub async fn probe(&self) -> anyhow::Result<usize> {
+        if self.peer_addr.is_none() {
+            return Err(anyhow!("peer_addr not set"));
+        }
+
+        let peer_addr = self.peer_addr.as_ref().unwrap();
+
+        let paths = self.local_addrs
+            .keys()
+            .map(|local_addr| {
+                (*local_addr, peer_addr.clone())
+            })
+            .collect::<HashSet<(SocketAddr, SocketAddr)>>();
+
+        let paths1 = self.conn
+            .path_stats().await
+            .map_err(|e| anyhow!(e))
+            .context("path_stats()")?
+            .into_iter()
+            .filter_map(|stats|{
+                if stats.validation_state != quiche::PathValidationState::Unknown {
+                    Some((stats.local_addr, stats.peer_addr))
+                } else {
+                    None
+                }
+            })
+            .collect::<HashSet<(SocketAddr, SocketAddr)>>();
+
+        let mut count: usize = 0;
+        for (local_addr, peer_addr) in paths.difference(&paths1) {
+            let seq = self.conn
+                .probe_path(*local_addr, *peer_addr).await
+                .map_err(|e| anyhow!(e))
+                .context("probe_path()")?;
+            info!("Probing ({}, {}) with seq={}", local_addr, peer_addr, seq);
+            count = count.saturating_add(1);
+        }
+        Ok(count)
+    }
+
+    pub async fn set_group(&self, local_addr: SocketAddr) -> anyhow::Result<usize> {
+        if self.peer_addr.is_none() {
+            return Err(anyhow!("peer_addr not set"));
+        }
+
+        let peer_addr = self.peer_addr.as_ref().unwrap();
+
+        let group_ids = self.local_addrs
+            .iter()
+            .find(|(local_addr1, _)| {
+                **local_addr1 == local_addr
+            })
+            .map(|(_, group_ids)| group_ids)
+            .ok_or(anyhow!("local_addr"))?;
+
+        let mut count: usize = 0;
+
+        for group_id in group_ids {
+            self.conn
+                .insert_group(local_addr, *peer_addr, *group_id).await
+                .map_err(|e| anyhow!(e))
+                .context("insert_group()")?;
+            info!("Inserting ({}, {}) into group {}", local_addr, *peer_addr, *group_id);
+            count = count.saturating_add(1);
+        }
+        Ok(count)
     }
 }
 
@@ -364,7 +514,7 @@ async fn local_to_remote(
     pcap_writer: Option<Arc<Mutex<PcapWriter<File>>>>,
     mut notify_shutdown: broadcast::Receiver<()>,
     _shutdown_complete: mpsc::Sender<()>,
-) -> anyhow::Result<()>{
+) -> anyhow::Result<()> {
     'main: loop {
         let mut buf = BytesMut::with_capacity(1350);
         buf.resize(1350, 0);

@@ -4,6 +4,7 @@ use log::{error, info};
 use rqst::quic::*;
 use rqst::vpn::*;
 use std::env;
+use std::io::prelude::*;
 use std::path::PathBuf;
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinSet;
@@ -21,6 +22,8 @@ async fn main() -> anyhow::Result<()> {
     let log_default_path = FileSpec::default()
         .directory(std::env::current_exe().unwrap().parent().unwrap())
         .as_pathbuf(None);
+
+    let config_default_path = std::env::current_exe().unwrap().with_file_name("rqst.toml");
 
     let matches = clap::command!()
         .propagate_version(true)
@@ -57,6 +60,13 @@ async fn main() -> anyhow::Result<()> {
                 .value_parser(clap::value_parser!(PathBuf))
                 .default_value(log_default_path.to_str().unwrap())
                 .help("log path"),
+        )
+        .arg(
+            clap::arg!(--config <file>)
+                .required(false)
+                .value_parser(clap::value_parser!(PathBuf))
+                .default_value(config_default_path.to_str().unwrap())
+                .help("config path"),
         )
         .get_matches();
 
@@ -144,11 +154,25 @@ async fn do_service(matches: &clap::ArgMatches) -> anyhow::Result<()> {
         let file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(keylog_path)
-            .unwrap();
+            .open(keylog_path)?;
         keylog = Some(file);
         config.log_keys();
     }
+
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .open(
+            matches
+                .get_one::<PathBuf>("config")
+                .ok_or(anyhow!("config's path not provided"))?
+                .to_str()
+                .ok_or(anyhow!("config's path includes non-UTF-8"))?,
+        )
+        .context("open config file")?;
+
+    let mut config_toml = String::new();
+    file.read_to_string(&mut config_toml)
+        .context("read from toml file")?;
 
     let cpus = num_cpus::get();
     info!("logical cores: {}", cpus);
@@ -181,22 +205,30 @@ async fn do_service(matches: &clap::ArgMatches) -> anyhow::Result<()> {
     };
 
     let mut set = JoinSet::new();
+    let mut pathmng = PathManager::new(conn.clone(), &config_toml).context("initialize PathManager")?;
 
-    if let Ok(paths) = conn.path_stats().await {
-        assert_eq!(paths.len(), 1);
-        let mut local_addr = paths[0].local_addr;
-        let peer_addr = paths[0].peer_addr;
+    let paths = conn
+        .path_stats()
+        .await
+        .map_err(|e| anyhow!(e))
+        .context("path_stats()")?;
 
-        conn.insert_group(local_addr, peer_addr, 1).await.ok();
+    assert_eq!(paths.len(), 1);
+    let mut local_addr = paths[0].local_addr;
+    let peer_addr = paths[0].peer_addr;
 
-        local_addr.set_port(local_addr.port() + 1);
-        let seq = conn
-            .probe_path(local_addr.clone(), peer_addr.clone())
-            .await
-            .map_err(|e| anyhow!(e))
-            .context("probe_path()")?;
-        info!("Probing ({}, {}) with seq={}", local_addr, peer_addr, seq);
-    }
+    pathmng.register_local_addr(local_addr, false);
+    pathmng.register_peer_addr(peer_addr);
+
+    pathmng.set_group(local_addr).await
+        .context("insert path into a group")?;
+
+    local_addr.set_port(local_addr.port() + 1);
+
+    pathmng.register_local_addr(local_addr, true);
+
+    pathmng.probe().await
+        .context("probing new path")?;
 
     let mut ctrlmng = ControlManager::new(false);
     let mut running_vpn = false;
@@ -216,6 +248,9 @@ async fn do_service(matches: &clap::ArgMatches) -> anyhow::Result<()> {
 
                     quiche::PathEvent::ReturnAvailable(local_addr, peer_addr) => {
                         info!("Path ({}, {})'s return is now available", local_addr, peer_addr);
+                        pathmng.set_group(local_addr).await
+                            .context("insert path into a group")?;
+                
                         if !running_vpn {
                             start_vpn(&conn,
                                 &mut ctrlmng,
@@ -228,7 +263,6 @@ async fn do_service(matches: &clap::ArgMatches) -> anyhow::Result<()> {
                                 .context("start vpn")?;
                             running_vpn = true;
                         }
-                        conn.insert_group(local_addr, peer_addr, 2).await.ok();
                     }
 
                     quiche::PathEvent::FailedValidation(local_addr, peer_addr) => {
