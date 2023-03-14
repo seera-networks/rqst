@@ -4,7 +4,7 @@ use log::{error, info};
 #[cfg(windows)]
 use once_cell::sync::Lazy;
 use rqst::quic::*;
-use rqst::vpn;
+use rqst::vpn::*;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 #[cfg(windows)]
@@ -396,22 +396,52 @@ async fn process_client(
     shutdown_complete_tx: mpsc::Sender<()>,
     enable_pktlog: bool,
 ) -> anyhow::Result<()> {
+    let mut ctrlmng = ControlManager::new(true);
+    let mut notify_shutdown_vpn = None;
     let mut set = JoinSet::new();
-    let (notify_shutdown_tx, _) = broadcast::channel(1);
-
-    set.spawn(vpn::transfer(
-        conn.clone(),
-        notify_shutdown_tx.subscribe(),
-        notify_shutdown_tx.subscribe(),
-        shutdown_complete_tx.clone(),
-        enable_pktlog,
-        false,
-        )
-    );
 
     info!("Enter loop for client");
     loop {
         tokio::select! {
+            res = conn.recv_stream_ready(None, Some((true, false, false, false))) => {
+                let readable = res.map_err(|e| anyhow!(e))
+                    .context("check stream's readness")?;
+                for stream_id in readable {
+                    match ctrlmng.recv_request(&conn, stream_id).await
+                        .with_context(|| format!("receive and parse request in {} stream", stream_id))?
+                    {
+                        Some((seq, RequestMsg::Start)) => {
+                            info!("Recv start request");
+                            let (notify_shutdown_tx, _) = broadcast::channel(1);
+                            set.spawn(transfer(
+                                conn.clone(),
+                                notify_shutdown_tx.subscribe(),
+                                notify_shutdown_tx.subscribe(),
+                                shutdown_complete_tx.clone(),
+                                enable_pktlog,
+                                false,
+                                )
+                            );
+                            notify_shutdown_vpn = Some(notify_shutdown_tx);
+                            ctrlmng.send_response_ok(&conn, seq).await
+                                .context("send response ok for start")?;
+                        }
+                        Some((seq, RequestMsg::Stop)) => {
+                            info!("Recv stop request");
+                            if let Some(notify) = notify_shutdown_vpn.take() {
+                                drop(notify);
+                                ctrlmng.send_response_ok(&conn, seq).await
+                                    .context("send response ok for stop")?;
+                            } else {
+                                ctrlmng.send_response_err(&conn, seq, "not running").await
+                                    .context("send response err for stop")?;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
             res = conn.path_event() => {
                 let event = res.map_err(|e| anyhow!(e))
                     .context("path_event()")?;
@@ -464,7 +494,7 @@ async fn process_client(
             }
             _ = notify_shutdown_rx.recv() => {
                 info!("Shutdown requested");
-                drop(notify_shutdown_tx);
+                drop(notify_shutdown_vpn);
                 while let Some(res) = set.join_next().await {
                     if let Err(e) = res? {
                         error!("Error occured in spawned task: {:?}", e);

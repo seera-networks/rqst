@@ -2,7 +2,7 @@ use anyhow::{anyhow, Context};
 use flexi_logger::{detailed_format, FileSpec, Logger, WriteMode};
 use log::{error, info};
 use rqst::quic::*;
-use rqst::vpn;
+use rqst::vpn::*;
 use std::env;
 use std::path::PathBuf;
 use tokio::sync::{broadcast, mpsc};
@@ -153,7 +153,7 @@ async fn do_service(matches: &clap::ArgMatches) -> anyhow::Result<()> {
     let cpus = num_cpus::get();
     info!("logical cores: {}", cpus);
 
-    let (notify_shutdown, _) = broadcast::channel(1);
+    let (notify_shutdown_tx, _) = broadcast::channel(1);
     let (shutdown_complete_tx, mut shutdown_complete_rx) = mpsc::channel(1);
 
     let quic = QuicHandle::new(
@@ -181,14 +181,6 @@ async fn do_service(matches: &clap::ArgMatches) -> anyhow::Result<()> {
     };
 
     let mut set = JoinSet::new();
-    set.spawn(vpn::transfer(
-        conn.clone(),
-        notify_shutdown.subscribe(),
-        notify_shutdown.subscribe(),
-        shutdown_complete_tx,
-        matches.is_present("pktlog"),
-        false,
-    ));
 
     if let Ok(paths) = conn.path_stats().await {
         assert_eq!(paths.len(), 1);
@@ -198,11 +190,16 @@ async fn do_service(matches: &clap::ArgMatches) -> anyhow::Result<()> {
         conn.insert_group(local_addr, peer_addr, 1).await.ok();
 
         local_addr.set_port(local_addr.port() + 1);
-        let seq = conn.probe_path(local_addr.clone(), peer_addr.clone()).await
+        let seq = conn
+            .probe_path(local_addr.clone(), peer_addr.clone())
+            .await
             .map_err(|e| anyhow!(e))
             .context("probe_path()")?;
         info!("Probing ({}, {}) with seq={}", local_addr, peer_addr, seq);
     }
+
+    let mut ctrlmng = ControlManager::new(false);
+    let mut running_vpn = false;
 
     loop {
         tokio::select! {
@@ -219,6 +216,18 @@ async fn do_service(matches: &clap::ArgMatches) -> anyhow::Result<()> {
 
                     quiche::PathEvent::ReturnAvailable(local_addr, peer_addr) => {
                         info!("Path ({}, {})'s return is now available", local_addr, peer_addr);
+                        if !running_vpn {
+                            start_vpn(&conn,
+                                &mut ctrlmng,
+                                &mut set,
+                                &notify_shutdown_tx,
+                                shutdown_complete_tx.clone(),
+                                matches.is_present("pktlog")
+                            )
+                                .await
+                                .context("start vpn")?;
+                            running_vpn = true;
+                        }
                         conn.insert_group(local_addr, peer_addr, 2).await.ok();
                     }
 
@@ -256,7 +265,8 @@ async fn do_service(matches: &clap::ArgMatches) -> anyhow::Result<()> {
 
             _ = tokio::signal::ctrl_c() => {
                 info!("Control C signaled");
-                drop(notify_shutdown);
+                drop(notify_shutdown_tx);
+                drop(shutdown_complete_tx);
                 break;
             }
         }
@@ -264,5 +274,41 @@ async fn do_service(matches: &clap::ArgMatches) -> anyhow::Result<()> {
     drop(conn);
     drop(quic);
     let _ = shutdown_complete_rx.recv().await;
+    Ok(())
+}
+
+async fn start_vpn(
+    conn: &QuicConnectionHandle,
+    ctrlmng: &mut ControlManager,
+    set: &mut JoinSet<anyhow::Result<()>>,
+    notify_shutdown_tx: &broadcast::Sender<()>,
+    shutdown_complete_tx: mpsc::Sender<()>,
+    enable_pktlog: bool,
+) -> anyhow::Result<()> {
+    info!("Sending start request");
+    let seq = ctrlmng
+        .send_start_request(&conn)
+        .await
+        .context("send start request")?;
+    match ctrlmng
+        .recv_response(&conn, seq)
+        .await
+        .context("recv response")?
+    {
+        ResponseMsg::Ok => {
+            info!("VPN service started");
+            set.spawn(transfer(
+                conn.clone(),
+                notify_shutdown_tx.subscribe(),
+                notify_shutdown_tx.subscribe(),
+                shutdown_complete_tx,
+                enable_pktlog,
+                false,
+            ));
+        }
+        ResponseMsg::Err(reason) => {
+            error!("Cannot start VPN service: {}", reason);
+        }
+    }
     Ok(())
 }
