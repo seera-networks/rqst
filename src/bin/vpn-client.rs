@@ -174,6 +174,7 @@ async fn do_service(matches: &clap::ArgMatches) -> anyhow::Result<()> {
         _ = tokio::signal::ctrl_c() => {
             info!("Control C signaled");
             drop(quic);
+            drop(shutdown_complete_tx);
             let _ = shutdown_complete_rx.recv().await;
             return Ok(());
         },
@@ -197,64 +198,67 @@ async fn do_service(matches: &clap::ArgMatches) -> anyhow::Result<()> {
         conn.insert_group(local_addr, peer_addr, 1).await.ok();
 
         local_addr.set_port(local_addr.port() + 1);
-        match conn.probe_path(local_addr, peer_addr).await {
-            Ok(seq) => {
-                info!("probe_path: dcid seq={}", seq);
-            }
-            Err(e) => {
-                info!("failed to probe_path: {:?}", e);
-            }
-        }
+        let seq = conn.probe_path(local_addr.clone(), peer_addr.clone()).await
+            .map_err(|e| anyhow!(e))
+            .context("probe_path()")?;
+        info!("Probing ({}, {}) with seq={}", local_addr, peer_addr, seq);
     }
 
-    tokio::select! {
-        res = set.join_next(), if !set.is_empty() => {
-            if let Some(ret) = res {
-                ret?;
+    loop {
+        tokio::select! {
+            res = conn.path_event() => {
+                let event = res.map_err(|e| anyhow!(e))
+                    .context("path_event()")?;
+                match event {
+                    quiche::PathEvent::New(..) => unreachable!(),
+
+                    quiche::PathEvent::Validated(local_addr, peer_addr) => {
+                        info!("Path ({}, {}) is now validated", local_addr, peer_addr);
+                        conn.set_active(local_addr, peer_addr, true).await.ok();
+                    }
+
+                    quiche::PathEvent::ReturnAvailable(local_addr, peer_addr) => {
+                        info!("Path ({}, {})'s return is now available", local_addr, peer_addr);
+                        conn.insert_group(local_addr, peer_addr, 2).await.ok();
+                    }
+
+                    quiche::PathEvent::FailedValidation(local_addr, peer_addr) => {
+                        info!("Path ({}, {}) failed validation", local_addr, peer_addr);
+                    }
+
+                    quiche::PathEvent::Closed(local_addr, peer_addr, e, reason) => {
+                        info!("Path ({}, {}) is now closed and unusable; err = {}, reason = {:?}",
+                            local_addr, peer_addr, e, reason);
+                    }
+
+                    quiche::PathEvent::ReusedSourceConnectionId(cid_seq, old, new) => {
+                        info!("Peer reused cid seq {} (initially {:?}) on {:?}",
+                            cid_seq, old, new);
+                    }
+
+                    quiche::PathEvent::PeerMigrated(..) => unreachable!(),
+
+                    quiche::PathEvent::PeerPathStatus(..) => {},
+
+                    quiche::PathEvent::InsertGroup(..) => unreachable!(),
+
+                    quiche::PathEvent::RemoveGroup(..) => unreachable!(),
+                }
             }
-        },
-        res = conn.path_event() => {
-            let event = res.map_err(|e| anyhow!(e))
-                .context("path_event()")?;
-            match event {
-                quiche::PathEvent::New(..) => unreachable!(),
 
-                quiche::PathEvent::Validated(local_addr, peer_addr) => {
-                    info!("Path ({}, {}) is now validated", local_addr, peer_addr);
-                    conn.set_active(local_addr, peer_addr, true).await.ok();
+            res = set.join_next(), if !set.is_empty() => {
+                if let Some(res) = res {
+                    if let Err(e) = res? {
+                        error!("Error occured in spawned task: {:?}", e);
+                    }
                 }
-
-                quiche::PathEvent::ReturnAvailable(local_addr, peer_addr) => {
-                    info!("Path ({}, {})'s return is now available", local_addr, peer_addr);
-                    conn.insert_group(local_addr, peer_addr, 2).await.ok();
-                }
-
-                quiche::PathEvent::FailedValidation(local_addr, peer_addr) => {
-                    info!("Path ({}, {}) failed validation", local_addr, peer_addr);
-                }
-
-                quiche::PathEvent::Closed(local_addr, peer_addr, e, reason) => {
-                    info!("Path ({}, {}) is now closed and unusable; err = {}, reason = {:?}",
-                        local_addr, peer_addr, e, reason);
-                }
-
-                quiche::PathEvent::ReusedSourceConnectionId(cid_seq, old, new) => {
-                    info!("Peer reused cid seq {} (initially {:?}) on {:?}",
-                        cid_seq, old, new);
-                }
-
-                quiche::PathEvent::PeerMigrated(..) => unreachable!(),
-
-                quiche::PathEvent::PeerPathStatus(..) => {},
-
-                quiche::PathEvent::InsertGroup(..) => unreachable!(),
-
-                quiche::PathEvent::RemoveGroup(..) => unreachable!(),
             }
-        },
 
-        _ = tokio::signal::ctrl_c() => {
-            drop(notify_shutdown);
+            _ = tokio::signal::ctrl_c() => {
+                info!("Control C signaled");
+                drop(notify_shutdown);
+                break;
+            }
         }
     }
     drop(conn);

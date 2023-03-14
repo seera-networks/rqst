@@ -457,13 +457,8 @@ async fn process_client(
             },
             res = set.join_next(), if !set.is_empty() => {
                 if let Some(res) = res {
-                    match res? {
-                        Ok(_) => {
-                            info!("subprocess_client() successfuly finish");
-                        }
-                        Err(e) => {
-                            info!("Error occured in subprocess_client(): {:?}", e);
-                        }
+                    if let Err(e) = res? {
+                        error!("Error occured in spawned task: {:?}", e);
                     }
                 }
             }
@@ -472,7 +467,7 @@ async fn process_client(
                 drop(notify_shutdown_tx);
                 while let Some(res) = set.join_next().await {
                     if let Err(e) = res? {
-                        error!("Error occured in process_client(): {:?}", e);
+                        error!("Error occured in spawned task: {:?}", e);
                     }
                 }
                 break;
