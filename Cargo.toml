@@ -6,10 +6,10 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-quiche = {git = "https://github.com/cloudflare/quiche.git", features = ["qlog"]}
+quiche = {path ="../quiche.seera-networks/quiche", features = ["qlog"]}
 ring = "0.16"
 url = "1"
-tokio = { version = "1.17", features = ["full", "tracing"] }
+tokio = { version = "1.21", features = ["full", "tracing"] }
 num_cpus = "1.0"
 bytes = "1"
 pcap-file = "1.1.1"
@@ -22,6 +22,13 @@ if-addrs = "0.7"
 if-watch = "0.3"
 async-stream = "0.3.3"
 tokio-stream = "0.1.9"
+serde = "1.0"
+serde_json = "1.0"
+toml = "0.5.9"
+anyhow = "1.0"
+tokio-util = { version = "0.7.7", features = ["codec"] }
+etherparse = "0.13"
+ipnet = { version = "2", features = ["serde"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
@@ -36,3 +43,7 @@ windows-service = "0.4.0"
 version = "0.35"
 features = ["Win32_Foundation", "Win32_System_IO", "Win32_Networking_WinSock",
             "Win32_Storage_FileSystem", "Win32_NetworkManagement_IpHelper"]
+
+[target.'cfg(windows)'.dependencies.windows]
+version = "0.43.0"
+features = ["Foundation", "Foundation_Collections", "Networking_Connectivity"]

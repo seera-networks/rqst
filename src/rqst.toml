@@ -1,0 +1,28 @@
+## Configuration for rqst VPN client
+
+[[path-groups]]
+name = "localnet"
+ipnets = ["192.168.1.0/24", "192.168.179.0/24", "2001:db8::/32"]
+
+[[path-groups]]
+name = "localnet-not-metered"
+ipnets = ["192.168.1.0/24", "192.168.179.0/24", "2001:db8::/32"]
+iftypes = ["not-metered"]
+
+[[path-groups]]
+name = "any-metered"
+iftypes = ["metered"]
+
+[[tunnels]]
+dscp = [0, 40]
+path-group = "localnet-not-metered"
+
+[exclude-ipv4net]
+exclude-ipnets = ["127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
+include-ipnets = ["192.168.1.0/24"]
+
+[exclude-ipv6net]
+exclude-ipnets = ["::1/128", "fe80::/64"]
+
+[exclude-iftype]
+iftypes = ["metered"]
