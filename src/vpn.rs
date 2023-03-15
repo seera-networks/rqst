@@ -595,7 +595,6 @@ async fn remote_to_local(
             },
             res = notify_tunnel_rx.recv() => {
                 tunnels.replace(res?);
-                info!("{:?} notified", tunnels);
             }
             _ = notify_shutdown.recv() => {
                 break 'main;
@@ -680,7 +679,6 @@ async fn local_to_remote(
             },
             res = notify_tunnel_rx.recv() => {
                 tunnels.replace(res?);
-                info!("{:?} notified", tunnels);
             }
             _ = notify_shutdown.recv() => {
                 break 'main;

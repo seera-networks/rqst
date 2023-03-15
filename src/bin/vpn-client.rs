@@ -2,6 +2,7 @@ use anyhow::{anyhow, Context};
 use flexi_logger::{detailed_format, FileSpec, Logger, WriteMode};
 use log::{error, info};
 use rqst::config::*;
+use rqst::ifwatch::{IfWatcherExt, IfEventExt};
 use rqst::quic::*;
 use rqst::vpn::*;
 use std::collections::HashMap;
@@ -258,36 +259,48 @@ async fn do_service(matches: &clap::ArgMatches) -> anyhow::Result<()> {
     let mut ctrlmng = ControlManager::new(false);
     let mut running_vpn = false;
 
-    /*
     for (dscp, group_id) in &tunnels {
-        notify_tunnel(&conn,
-            &mut ctrlmng,
-            *dscp,
-            *group_id
-        )
+        notify_tunnel(&conn, &mut ctrlmng, *dscp, *group_id)
             .await
             .context("notify tunnel")?;
     }
-    */
 
     let (notify_tunnel_tx, _) = broadcast::channel::<HashMap<u8, u64>>(100);
 
     if !running_vpn {
-        start_vpn(&conn,
+        start_vpn(
+            &conn,
             &mut ctrlmng,
             &mut set,
             &notify_shutdown_tx,
             &notify_tunnel_tx,
             shutdown_complete_tx.clone(),
-            matches.is_present("pktlog")
+            matches.is_present("pktlog"),
         )
-            .await
-            .context("start vpn")?;
+        .await
+        .context("start vpn")?;
         running_vpn = true;
     }
 
+    use ipnet::IpNet;
+    let exclude_ipnets: Vec<IpNet> = vec!["172.16.0.0/12".parse()?];
+    let mut ifwatcher = IfWatcherExt::new(exclude_ipnets, false)
+        .await
+        .context("initialize IfWatcherExt")?;
+
+    let (notify_ipchange_tx, mut notify_ipchange_rx) = mpsc::channel(1);
+
+    let ipwatch_handle = tokio::task::spawn(watch_ipchange(
+        ifwatcher,
+        notify_ipchange_tx,
+    ));
+
     loop {
         tokio::select! {
+            res = notify_ipchange_rx.recv() => {
+                let event = res.context("recv ipchange event")?;
+                info!("{:?}", event);
+            }
             res = conn.path_event() => {
                 let event = res.map_err(|e| anyhow!(e))
                     .context("path_event()")?;
@@ -337,22 +350,70 @@ async fn do_service(matches: &clap::ArgMatches) -> anyhow::Result<()> {
 
             res = set.join_next(), if !set.is_empty() => {
                 if let Some(res) = res {
-                    if let Err(e) = res? {
-                        error!("Error occured in spawned task: {:?}", e);
+                    match res {
+                        Ok(res) => {
+                            if let Err(e) = res {
+                                error!("Error occured in spawned task: {:?}", e);
+                            }        
+                        }
+                        Err(e) => {
+                            error!("Spawned task aborted: {:?}", e);
+                        }
                     }
                 }
             }
 
             _ = tokio::signal::ctrl_c() => {
-                info!("Control C signaled");
+                info!("Ctrl-C signaled");
+                ipwatch_handle.abort();
                 drop(notify_shutdown_tx);
-                drop(shutdown_complete_tx);
                 break;
             }
         }
     }
+    conn.path_stats()
+        .await
+        .map_err(|e| anyhow!(e))
+        .context("path_stats()")?
+        .iter()
+        .for_each(|stats| {
+            info!("{:?}", stats);
+        });
+
+    conn.close()
+        .await
+        .map_err(|e| anyhow!(e))
+        .context("close()")?;
+
+    drop(pathmng);
+    drop(tunnelmng);
     drop(conn);
     drop(quic);
+    drop(shutdown_complete_tx);
+    while let Some(res) = set.join_next().await {
+        match res {
+            Ok(res) => {
+                if let Err(e) = res {
+                    error!("Error occured in spawned task: {:?}", e);
+                }        
+            }
+            Err(e) => {
+                error!("Spawned task aborted: {:?}", e);
+            }
+        }
+    }
+    match ipwatch_handle.await {
+        Ok(res) => {
+            if let Err(e) = res {
+                error!("Error occured in watch_ipchange(): {:?}", e);
+            }
+        }
+        Err(e) => {
+            if !e.is_cancelled() {
+                error!("Panic in watch_ipchange()?: {:?}", e);
+            }
+        }
+    }
     let _ = shutdown_complete_rx.recv().await;
     Ok(())
 }
@@ -400,9 +461,10 @@ async fn notify_tunnel(
     conn: &QuicConnectionHandle,
     ctrlmng: &mut ControlManager,
     dscp: u8,
-    group_id: u64
+    group_id: u64,
 ) -> anyhow::Result<()> {
-    let seq = ctrlmng.send_tunnel_request(&conn, dscp, group_id)
+    let seq = ctrlmng
+        .send_tunnel_request(&conn, dscp, group_id)
         .await
         .context("sending tunnel request")?;
     info!("Notify tunnel: dscp={}, group_id={}", dscp, group_id);
@@ -419,4 +481,19 @@ async fn notify_tunnel(
         }
     }
     Ok(())
+}
+
+async fn watch_ipchange(
+    mut ifwatcher: IfWatcherExt,
+    notify_ipchange_tx: mpsc::Sender<IfEventExt>
+) -> anyhow::Result<()> {
+    info!("Enter watch_ipchange's loop");
+    loop {
+        let event = ifwatcher.pop()
+            .await
+            .context("IfWatcherExt::pop")?;
+        notify_ipchange_tx.send(event)
+            .await
+            .context("send ipchange event")?;
+    }
 }
