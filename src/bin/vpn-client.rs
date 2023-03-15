@@ -258,6 +258,7 @@ async fn do_service(matches: &clap::ArgMatches) -> anyhow::Result<()> {
     let mut ctrlmng = ControlManager::new(false);
     let mut running_vpn = false;
 
+    /*
     for (dscp, group_id) in &tunnels {
         notify_tunnel(&conn,
             &mut ctrlmng,
@@ -267,6 +268,7 @@ async fn do_service(matches: &clap::ArgMatches) -> anyhow::Result<()> {
             .await
             .context("notify tunnel")?;
     }
+    */
 
     let (notify_tunnel_tx, _) = broadcast::channel::<HashMap<u8, u64>>(100);
 

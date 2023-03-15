@@ -401,6 +401,7 @@ async fn process_client(
     let mut tunnelmng = TunnelManager::new(conn.clone(), HashMap::new());
     let (notify_tunnel_tx, _) = broadcast::channel::<HashMap<u8, u64>>(100);
     let mut notify_shutdown_vpn = None;
+    let mut running_vpn = false;
     let mut set = JoinSet::new();
 
     info!("Enter loop for client");
@@ -410,7 +411,6 @@ async fn process_client(
                 let readable = res.map_err(|e| anyhow!(e))
                     .context("check stream's readness")?;
                 for stream_id in readable {
-                    println!("stream: {}", stream_id);
                     match ctrlmng.recv_request(&conn, stream_id).await
                         .with_context(|| format!("receive and parse request in {} stream", stream_id))?
                     {
@@ -429,13 +429,22 @@ async fn process_client(
                                 )
                             );
                             notify_shutdown_vpn = Some(notify_shutdown_tx);
+                            running_vpn = true;
                             ctrlmng.send_response_ok(&conn, seq).await
                                 .context("send response ok for start")?;
+
+                            let available = tunnelmng
+                                .available()
+                                .await
+                                .context("get available tunnels")?;
+                            notify_tunnel_tx.send(available)
+                                .context("notify tunnel")?;
                         }
                         Some((seq, RequestMsg::Stop)) => {
                             info!("Recv stop request");
                             if let Some(notify) = notify_shutdown_vpn.take() {
                                 drop(notify);
+                                running_vpn = false;
                                 ctrlmng.send_response_ok(&conn, seq).await
                                     .context("send response ok for stop")?;
                             } else {
@@ -495,12 +504,14 @@ async fn process_client(
                     quiche::PathEvent::InsertGroup(group_id, (local_addr, peer_addr)) => {
                         info!("Peer inserts path ({}, {}) into group {}",
                             local_addr, peer_addr, group_id);
-                        let available = tunnelmng
-                            .available()
-                            .await
-                            .context("get available tunnels")?;
-                        notify_tunnel_tx.send(available)
-                            .context("notify tunnel")?;
+                        if running_vpn {
+                            let available = tunnelmng
+                                .available()
+                                .await
+                                .context("get available tunnels")?;
+                            notify_tunnel_tx.send(available)
+                                .context("notify tunnel")?;
+                        }
                     },
 
                     quiche::PathEvent::RemoveGroup(..) => unreachable!(),
