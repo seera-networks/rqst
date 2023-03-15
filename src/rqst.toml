@@ -32,5 +32,8 @@ path-group = "metered"
 exclude-ipnets = ["127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
 include-ipnets = ["192.168.1.0/24"]
 
+[exclude-ipv6net]
+exclude-ipnets = ["::1/128", "fe80::/64"]
+
 [[exclude-iftypes]]
 iftype = "metered"

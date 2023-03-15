@@ -283,17 +283,29 @@ async fn do_service(matches: &clap::ArgMatches) -> anyhow::Result<()> {
         running_vpn = true;
     }
 
-    let exclude_ipnets = client_config.exclude_ipv4net.exclude_ipnets
+    let mut exclude_ipnets = client_config.exclude_ipv4net.exclude_ipnets
         .iter()
         .copied()
         .map(|v| v.into())
         .collect::<Vec<IpNet>>();
+    let mut exclude_ipv6nets = client_config.exclude_ipv6net.exclude_ipnets
+        .iter()
+        .copied()
+        .map(|v| v.into())
+        .collect::<Vec<IpNet>>();
+    exclude_ipnets.append(&mut exclude_ipv6nets);
 
-    let include_ipnets = client_config.exclude_ipv4net.include_ipnets
+    let mut include_ipnets = client_config.exclude_ipv4net.include_ipnets
         .iter()
         .copied()
         .map(|v| v.into())
         .collect::<Vec<IpNet>>();
+    let mut include_ipv6nets = client_config.exclude_ipv6net.include_ipnets
+        .iter()
+        .copied()
+        .map(|v| v.into())
+        .collect::<Vec<IpNet>>();
+    include_ipnets.append(&mut include_ipv6nets);
 
     let exclude_metered = client_config.exclude_iftypes
         .iter()
@@ -314,7 +326,7 @@ async fn do_service(matches: &clap::ArgMatches) -> anyhow::Result<()> {
             }
         });
 
-    info!("exclude ipv4net: {:?}, include ipv4net: {:?}, exclude_metered: {}, exclude_not_metered: {}",
+    info!("exclude ipnet: {:?}, include ipnet: {:?}, exclude_metered: {}, exclude_not_metered: {}",
         exclude_ipnets,
         include_ipnets,
         exclude_metered,

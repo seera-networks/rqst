@@ -1,6 +1,6 @@
 use std::str::FromStr;
 
-use ipnet::Ipv4Net;
+use ipnet::{Ipv4Net, Ipv6Net};
 use serde::{Deserialize, Serialize};
 
 /// Configuration file template
@@ -58,6 +58,20 @@ fn default_exclude_ipv4net() -> ExcludeIpv4Net {
     }
 }
 
+fn default_ipv6net() -> Ipv6Net {
+    Ipv6Net::from_str("::/0").unwrap()
+}
+
+fn default_ipv6nets() -> Vec<Ipv6Net> {
+    Vec::new()
+}
+
+fn default_exclude_ipv6net() -> ExcludeIpv6Net {
+    ExcludeIpv6Net {
+        exclude_ipnets: Vec::new(),
+        include_ipnets: Vec::new(),   
+    }
+}
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClientConfig {
     #[serde(rename = "path-groups" ,default)]
@@ -68,6 +82,9 @@ pub struct ClientConfig {
 
     #[serde(rename = "exclude-ipv4net", default = "default_exclude_ipv4net")]
     pub exclude_ipv4net: ExcludeIpv4Net,
+
+    #[serde(rename = "exclude-ipv6net", default = "default_exclude_ipv6net")]
+    pub exclude_ipv6net: ExcludeIpv6Net,
 
     #[serde(rename = "exclude-iftypes", default)]
     pub exclude_iftypes: Vec<ExcludeIfType>,
@@ -132,6 +149,15 @@ pub struct ExcludeIpv4Net {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExcludeIpv6Net {
+    #[serde(rename = "exclude-ipnets", default = "default_ipv6nets")]
+    pub exclude_ipnets: Vec<Ipv6Net>,
+    #[serde(rename = "include-ipnets", default = "default_ipv6nets")]
+    pub include_ipnets: Vec<Ipv6Net>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "iftype", deny_unknown_fields)]
 pub enum ExcludeIfType {
     #[serde(rename = "metered")]
@@ -163,6 +189,8 @@ mod test {
         [exclude-ipv4net]
         exclude-ipnets = ["127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
         include-ipnets = ["192.168.1.0/24"]
+        [exclude-ipv6net]
+        exclude-ipnets = ["::1/128", "fe80::/64"]
         [[exclude-iftypes]]
         iftype = "metered"
     "#;
@@ -209,6 +237,16 @@ mod test {
                 include_ipnets: vec![
                     Ipv4Net::from_str("192.168.1.0/24").unwrap(),
                 ]
+            }
+        );
+        assert_eq!(
+            cfg.exclude_ipv6net,
+            ExcludeIpv6Net {
+                exclude_ipnets: vec![
+                    Ipv6Net::from_str("::1/128").unwrap(),
+                    Ipv6Net::from_str("fe80::/64").unwrap(),
+                ],
+                include_ipnets: Vec::new()
             }
         );
         assert_eq!(
