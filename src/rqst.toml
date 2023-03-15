@@ -1,0 +1,29 @@
+## Configuration for rqst VPN client
+
+## Path groups
+[[path-groups]]
+kind = "ipv4net"
+name = "localnet"
+ipnet = "192.168.1.0/24"
+
+[[path-groups]]
+kind = "iftype"
+name = "metered"
+iftype = "metered"
+
+[[path-groups]]
+kind = "iftype"
+name = "not-metered"
+iftype = "not-metered"
+
+[[tunnels]]
+dscp = 0
+path-group = "not-metered"
+
+[[tunnels]]
+dscp = 40
+path-group = "not-metered"
+
+[[tunnels]]
+dscp = 56
+path-group = "metered"
