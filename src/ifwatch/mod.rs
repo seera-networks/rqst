@@ -7,9 +7,9 @@ mod windows;
 #[cfg(windows)]
 use self::windows::*;
 
-use anyhow::{anyhow, Context};
+use anyhow::Context;
 use if_watch::{IfEvent, IfWatcher};
-use ipnet::{IpNet, Ipv4Net, Ipv6Net};
+use ipnet::IpNet;
 use std::collections::HashSet;
 use std::pin::Pin;
 

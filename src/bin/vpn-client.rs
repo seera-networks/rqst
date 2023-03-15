@@ -281,7 +281,7 @@ async fn do_service(matches: &clap::ArgMatches) -> anyhow::Result<()> {
         stream_map.remove(&ipaddr);
     }
     let conn = conns.pop().expect("no conn");
- 
+
     let (notify_shutdown_tx, _) = broadcast::channel(1);
     let mut set = JoinSet::new();
     let mut pathmng = PathManager::new(conn.clone(), client_config.clone());
@@ -342,7 +342,6 @@ async fn do_service(matches: &clap::ArgMatches) -> anyhow::Result<()> {
     }
 
     let mut ctrlmng = ControlManager::new(false);
-    let mut running_vpn = false;
 
     for (dscp, group_id) in &tunnels {
         notify_tunnel(&conn, &mut ctrlmng, *dscp, *group_id)
@@ -352,20 +351,17 @@ async fn do_service(matches: &clap::ArgMatches) -> anyhow::Result<()> {
 
     let (notify_tunnel_tx, _) = broadcast::channel::<HashMap<u8, u64>>(100);
 
-    if !running_vpn {
-        start_vpn(
-            &conn,
-            &mut ctrlmng,
-            &mut set,
-            &notify_shutdown_tx,
-            &notify_tunnel_tx,
-            shutdown_complete_tx.clone(),
-            matches.is_present("pktlog"),
-        )
-        .await
-        .context("start vpn")?;
-        running_vpn = true;
-    }
+    start_vpn(
+        &conn,
+        &mut ctrlmng,
+        &mut set,
+        &notify_shutdown_tx,
+        &notify_tunnel_tx,
+        shutdown_complete_tx.clone(),
+        matches.is_present("pktlog"),
+    )
+    .await
+    .context("start vpn")?;
 
     loop {
         tokio::select! {

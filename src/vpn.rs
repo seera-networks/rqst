@@ -6,10 +6,9 @@ use bytes::{BufMut, BytesMut};
 use etherparse::{IpHeader, PacketHeaders};
 use pcap_file::pcap::PcapWriter;
 use serde::{Deserialize, Serialize};
-use socket2::Socket;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{File, OpenOptions};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 use tokio::sync::{broadcast, mpsc};
@@ -453,7 +452,7 @@ pub async fn transfer(
         let tap2 = tap.clone();
         let pcap_writer1 = pcap_writer.clone();
         let shutdown_complete1 = shutdown_complete.clone();
-        let mut task = tokio::spawn(async move {
+        let mut task = tokio::spawn(
             remote_to_local(
                 quic,
                 tap1,
@@ -462,9 +461,8 @@ pub async fn transfer(
                 notify_tunnel_rx,
                 shutdown_complete,
             )
-            .await;
-        });
-        let mut task1 = tokio::spawn(async move {
+        );
+        let mut task1 = tokio::spawn(
             local_to_remote(
                 quic1,
                 tap2,
@@ -473,8 +471,7 @@ pub async fn transfer(
                 notify_tunnel_rx1,
                 shutdown_complete1,
             )
-            .await;
-        });
+        );
         let mut task_finished = false;
         let mut task1_finished = false;
         loop {

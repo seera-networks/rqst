@@ -7,7 +7,7 @@ use if_watch::IfWatcher;
 use rqst::{quic::*, vpn::*};
 use std::env;
 use std::time::{Duration, Instant};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 use tokio_util::codec::{FramedRead, LinesCodec};
 

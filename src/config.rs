@@ -29,7 +29,6 @@ include-ipnets = ["192.168.1.0/24"]
 
 [exclude-ipv6net]
 exclude-ipnets = ["::1/128", "fe80::/64"]
-
 [exclude-iftype]
 iftypes = ["metered"]
 "#;

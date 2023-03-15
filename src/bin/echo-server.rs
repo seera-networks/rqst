@@ -4,7 +4,6 @@ use anyhow::{anyhow, Context};
 use log::{error, info};
 use rqst::{quic::*, vpn::*};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinSet;
 
