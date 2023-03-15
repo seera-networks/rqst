@@ -410,6 +410,7 @@ async fn process_client(
                 let readable = res.map_err(|e| anyhow!(e))
                     .context("check stream's readness")?;
                 for stream_id in readable {
+                    println!("stream: {}", stream);
                     match ctrlmng.recv_request(&conn, stream_id).await
                         .with_context(|| format!("receive and parse request in {} stream", stream_id))?
                     {
@@ -449,7 +450,9 @@ async fn process_client(
                                 .context("send response ok for tunnel")?;
                         }
 
-                        _ => {}
+                        msg => {
+                            info!("Recv unknown request: {:?}", msg);
+                        }
                     }
                 }
             }
