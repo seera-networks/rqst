@@ -13,6 +13,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::{JoinHandle, JoinSet};
+use tokio_stream::{Stream, StreamExt, StreamMap};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -184,11 +185,10 @@ async fn do_service(matches: &clap::ArgMatches) -> anyhow::Result<()> {
     let cpus = num_cpus::get();
     info!("logical cores: {}", cpus);
 
-    let (mut watch_ipchange_handle, mut notify_ipchange_rx) = start_watch_ipchange(&client_config)
+    let (watch_ipchange_handle, mut notify_ipchange_rx) = start_watch_ipchange(&client_config)
         .await
         .context("initialize ifwatcher")?;
 
-    let (notify_shutdown_tx, _) = broadcast::channel(1);
     let (shutdown_complete_tx, mut shutdown_complete_rx) = mpsc::channel(1);
 
     let quic = QuicHandle::new(
@@ -199,26 +199,88 @@ async fn do_service(matches: &clap::ArgMatches) -> anyhow::Result<()> {
         shutdown_complete_tx.clone(),
     );
 
-    info!("Connecting to {}", &url);
-    let conn = quic
-        .connect(url)
-        .await
-        .map_err(|e| anyhow!(e))
-        .context("connect()")?;
-    tokio::select! {
-        res = conn.wait_connected() => {
-            res.map_err(|e| anyhow!(e)).context("wait_connected()")?;
-            info!("Connection established: {}", conn.conn_handle);
-        },
-        _ = tokio::signal::ctrl_c() => {
-            info!("Control C signaled");
-            drop(quic);
-            drop(shutdown_complete_tx);
-            let _ = shutdown_complete_rx.recv().await;
-            return Ok(());
-        },
-    };
+    let (notify_shutdown_tx, _) = broadcast::channel::<()>(1);
+    let mut stream_map = StreamMap::new();
 
+    let mut conns = Vec::new();
+    loop {
+        tokio::select! {
+            res = notify_ipchange_rx.recv() => {
+                let event = res.context("recv ipchange event")?;
+                match event {
+                    IfEventExt::Up((ipnet, metered)) => {
+                        info!("Local address {}(metered: {}) up", ipnet, metered);
+
+                        info!("Connecting to {}", &url);
+                        let conn = quic
+                            .connect(url.clone())
+                            .await
+                            .map_err(|e| anyhow!(e))
+                            .context("connect()")?;
+
+                        let mut notify_shutdown_rx = notify_shutdown_tx.subscribe();
+                        let stream = Box::pin(async_stream::stream! {
+                            tokio::select! {
+                                res = conn.wait_connected() => {
+                                    match res {
+                                        Ok(_) => {
+                                            info!("Connection using {} established: {}", ipnet, conn.conn_handle);
+                                            yield Ok(conn);
+                                        }
+                                        Err(e) => {
+                                            yield Err(anyhow!(e));
+                                        }
+                                    }
+                                }
+                                _ = notify_shutdown_rx.recv() => {
+                                    info!("Connection using {} canceled: {}", ipnet, conn.conn_handle);
+                                    if let Err(e) = conn.close().await {
+                                        error!("Error occured in conn.close(): {:?}", e);
+                                    }
+                                    yield Err(anyhow!("wait connected canceled"));
+                                }
+                            }
+                        }) as Pin<Box<dyn Stream<Item = anyhow::Result<QuicConnectionHandle>> + Send>>;
+                        stream_map.insert(ipnet, stream);
+                    }
+                    IfEventExt::Down(ipnet) => {
+                        info!("Local address {} down", ipnet);
+                    }
+                }
+            }
+
+            res = stream_map.next(), if !stream_map.is_empty() => {
+                let (ipnet, res) = res.context("StreamMap::next()")?;
+                match res {
+                    Ok(conn) => {
+                        info!("Connection established: {}", conn.conn_handle);
+                        conns.push(conn);
+                        stream_map.remove(&ipnet);
+                        drop(notify_shutdown_tx);
+                        break;
+                    }
+                    Err(e) => {
+                        error!("connect failed: {:?}", e);
+                    }
+                }
+            },
+            _ = tokio::signal::ctrl_c() => {
+                info!("Control C signaled");
+                drop(notify_shutdown_tx);
+                drop(quic);
+                drop(stream_map);
+                drop(shutdown_complete_tx);
+                let _ = shutdown_complete_rx.recv().await;
+                return Ok(());
+            },
+        }
+    }
+    while let Some((ipnet, _)) = stream_map.next().await {
+        stream_map.remove(&ipnet);
+    }
+    let conn = conns.pop().expect("no conn");
+ 
+    let (notify_shutdown_tx, _) = broadcast::channel(1);
     let mut set = JoinSet::new();
     let mut pathmng = PathManager::new(conn.clone(), client_config.clone());
 
