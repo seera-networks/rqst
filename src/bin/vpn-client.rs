@@ -240,11 +240,19 @@ async fn do_service(matches: &clap::ArgMatches) -> anyhow::Result<()> {
         .iter()
         .filter_map(|tunnel| {
             if let Some(group_id) = pathmng.names_to_path_groups.get(&tunnel.path_group) {
-                Some((tunnel.dscp, *group_id))
-            } else {
-                None
+                if !tunnel.dscp.is_empty() {
+                    return Some(
+                        tunnel.dscp
+                            .iter()
+                            .copied()
+                            .map(|v| (v, *group_id))
+                            .collect::<Vec<(u8, u64)>>()
+                    );
+                }
             }
+            None
         })
+        .flatten()
         .for_each(|(dscp, group_id)| {
             tunnels.insert(dscp, group_id);
         });
@@ -295,19 +303,19 @@ async fn do_service(matches: &clap::ArgMatches) -> anyhow::Result<()> {
         .collect::<Vec<IpNet>>();
     include_ipnets.append(&mut include_ipv6nets);
 
-    let exclude_metered = client_config.exclude_iftypes
+    let exclude_metered = client_config.exclude_iftype.iftypes
         .iter()
         .any(|v| {
-            if let ExcludeIfType::Metred = v {
+            if let IfType::Metered = v {
                 true
             } else {
                 false
             }
         });
-    let exclude_not_metered = client_config.exclude_iftypes
+    let exclude_not_metered = client_config.exclude_iftype.iftypes
         .iter()
         .any(|v| {
-            if let ExcludeIfType::NotMetred = v {
+            if let IfType::NotMetered = v {
                 true
             } else {
                 false

@@ -245,7 +245,7 @@ impl PathManager {
     pub fn new(conn: QuicConnectionHandle, client_config: ClientConfig) -> Self {
         let mut names_to_path_groups = BTreeMap::new();
         for (i, path_group) in client_config.path_groups.iter().enumerate() {
-            names_to_path_groups.insert(path_group.name().to_string(), i as u64 + 1);
+            names_to_path_groups.insert(path_group.name.to_string(), i as u64 + 1);
         }
         PathManager {
             conn,
@@ -262,30 +262,24 @@ impl PathManager {
         }
         let mut group_ids = HashSet::new();
         for path_group in &self.client_config.path_groups {
-            let name = match (path_group, local_addr.ip(), metered) {
-                (PathGroup::Ipv4Net(Ipv4NetPathGroup { ipnet, .. }), IpAddr::V4(ipaddr), _) => {
-                    if ipnet.contains(&ipaddr) {
-                        Some(path_group.name().to_string())
-                    } else {
-                        None
-                    }
-                }
-                (PathGroup::IfType(IfTypePathGroup::Metred { .. }), _, true) => {
-                    Some(path_group.name().to_string())
-                }
-                (PathGroup::IfType(IfTypePathGroup::NotMetred { .. }), _, false) => {
-                    Some(path_group.name().to_string())
-                }
-                _ => None,
-            };
-            if let Some(name) = name {
-                let group_id = self
-                    .names_to_path_groups
-                    .get(&name)
-                    .copied()
-                    .expect("old names_to_path_groups?");
-                group_ids.insert(group_id);
+            if !path_group.ipnets
+                .iter()
+                .any(|v| v.contains(&local_addr.ip()))
+            {
+                continue;
             }
+            if !path_group.iftypes
+                .iter()
+                .any(|v| v.is_metered() == metered)
+            {
+                continue;
+            }
+            let group_id = self
+                .names_to_path_groups
+                .get(&path_group.name.to_string())
+                .copied()
+                .expect("names_to_path_groups modified?");
+            group_ids.insert(group_id);
         }
         self.local_addrs.insert(local_addr, group_ids);
         true
