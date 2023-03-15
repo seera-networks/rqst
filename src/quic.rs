@@ -12,7 +12,7 @@ use tokio_stream::{Stream, StreamExt, StreamMap};
 use ring::rand::*;
 use std::net::{SocketAddr, ToSocketAddrs};
 
-use crate::sas::{bind_sas, select_local_addr, send_sas, try_recv_sas};
+use crate::sas::{bind_sas, select_local_ipaddr, send_sas, try_recv_sas};
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 pub type Result<T> = std::result::Result<T, Error>;
@@ -53,6 +53,7 @@ enum ActorMessage {
     },
     Connect {
         url: url::Url,
+        local_addr: Option<SocketAddr>,
         respond_to: oneshot::Sender<Result<ConnectionHandle>>,
     },
     WaitConnected {
@@ -122,7 +123,7 @@ enum ActorMessage {
         conn_handle: ConnectionHandle,
         local_addr: SocketAddr,
         peer_addr: SocketAddr,
-        respond_to: oneshot::Sender<Result<u64>>,
+        respond_to: oneshot::Sender<Result<(SocketAddr, u64)>>,
     },
     PathEventReadness {
         conn_handle: ConnectionHandle,
@@ -197,7 +198,7 @@ struct SendStreamRequest {
 struct ProbePathRequest {
     local_addr: SocketAddr,
     peer_addr: SocketAddr,
-    respond_to: oneshot::Sender<Result<u64>>,
+    respond_to: oneshot::Sender<Result<(SocketAddr, u64)>>,
 }
 
 struct PathEventReadnessRequest {
@@ -234,22 +235,23 @@ impl QuicActor {
         }
     }
 
-    async fn add_socket(&mut self, local: SocketAddr) -> std::io::Result<SocketHandle> {
-        if self.addrs_to_sockets.contains_key(&local) {
+    async fn add_socket(&mut self, local: SocketAddr) -> std::io::Result<(SocketHandle, SocketAddr)> {
+        if local.port() != 0 && self.addrs_to_sockets.contains_key(&local) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::AddrInUse,
                 "Already added",
             ));
         }
         let socket = bind_sas(&local).await?;
-        let socket: socket2::Socket = socket.into_std().unwrap().into();
-        socket.set_recv_buffer_size(0x7fffffff).unwrap();
+        let binded_local = socket.local_addr().expect("no local address");
+        let socket: socket2::Socket = socket.into_std()?.into();
+        socket.set_recv_buffer_size(0x7fffffff)?;
         let socket: std::net::UdpSocket = socket.into();
-        let socket = Arc::new(tokio::net::UdpSocket::from_std(socket).unwrap());
+        let socket = Arc::new(tokio::net::UdpSocket::from_std(socket)?);
 
         let socket_handle = self.next_socket_handle;
         self.sockets.insert(socket_handle, socket.clone());
-        self.addrs_to_sockets.insert(local, socket_handle);
+        self.addrs_to_sockets.insert(binded_local, socket_handle);
         self.next_socket_handle += 1;
 
         let stream = Box::pin(async_stream::stream! {
@@ -264,7 +266,7 @@ impl QuicActor {
                                 let from = from.unwrap();
                                 let to = if to.is_some() {
                                     let mut to = to.unwrap();
-                                    to.set_port(local.port());
+                                    to.set_port(binded_local.port());
                                     to
                                 } else {
                                     local
@@ -285,7 +287,7 @@ impl QuicActor {
         })
             as Pin<Box<dyn Stream<Item = (BytesMut, SocketAddr, SocketAddr)> + Send>>;
         self.recv_stream.insert(socket_handle, stream);
-        Ok(socket_handle)
+        Ok((socket_handle, binded_local))
     }
 
     async fn handle_message(&mut self, msg: ActorMessage) {
@@ -307,21 +309,70 @@ impl QuicActor {
                     let _ = respond_to.send(Err(format!("add_socket failed: {:?}", e).into()));
                 }
             },
-            ActorMessage::Connect { url, respond_to } => {
-                let to = url.to_socket_addrs().unwrap().next().unwrap();
-                let from = select_local_addr(to, None).await.unwrap();
+            ActorMessage::Connect {
+                url,
+                local_addr,
+                respond_to,
+            } => {
+                let (to, mut from) = if let Some(local_addr) = local_addr {
+                    let to = match url.to_socket_addrs() {
+                        Ok(mut addrs) => {
+                            let addr = addrs.find(|v|
+                                v.is_ipv4() == local_addr.is_ipv4() ||
+                                v.is_ipv6() == local_addr.is_ipv6()
+                            );
+                            if let Some(addr) = addr {
+                                addr
+                            } else {
+                                let _ = respond_to.send(Err(format!("No address for {:?}", url).into()));
+                                return;
+                            }
+                        }
+                        Err(e) => {
+                            let _ = respond_to.send(Err(format!("{:?} not resolved: {:?}", url, e).into()));
+                            return; 
+                        }
+                    };
+                    (to, local_addr)
+                } else {
+                    let to = match url.to_socket_addrs() {
+                        Ok(mut addrs) => {
+                            if let Some(addr) = addrs.next() {
+                                addr
+                            } else {
+                                let _ = respond_to.send(Err(format!("No address for {:?}", url).into()));
+                                return;
+                            }
+                        }
+                        Err(e) => {
+                            let _ = respond_to.send(Err(format!("{:?} not resolved: {:?}", url, e).into()));
+                            return; 
+                        }
+                    };
+                    let from = SocketAddr::new(
+                        select_local_ipaddr(to, None).await.unwrap(),
+                        0
+                    );
+                    (to, from)
+                };
                 let local = if to.is_ipv4() {
                     SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), from.port())
                 } else {
                     SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), from.port())
                 };
-                let socket_handle = match self.add_socket(local).await {
+
+                let (socket_handle, binded_local) = match self.add_socket(local).await {
                     Ok(v) => v,
                     Err(e) => {
-                        let _ = respond_to.send(Err(format!("get_binding failed: {:?}", e).into()));
+                        let _ = respond_to.send(Err(format!("add_socket() failed: {:?}", e).into()));
                         return;
                     }
                 };
+                if from.port() == 0 {
+                    from.set_port(binded_local.port());
+                }
+                info!("from: {}, binded_local: {}", from, binded_local);
+                
                 // Generate a random source connection ID for the connection.
                 let mut scid = [0; quiche::MAX_CONN_ID_LEN];
                 let scid = &mut scid[0..self.conn_id_len];
@@ -411,27 +462,23 @@ impl QuicActor {
                         stream_ids
                             .intersection(&readable)
                             .cloned()
-                            .filter(|id| {
-                                match (*id & 0x03, filter) {
-                                    (0x00, (true, _, _, _))
-                                    | (0x01, (_, true, _, _))
-                                    | (0x02, (_, _, true, _))
-                                    | (0x03, (_, _, _, true)) => true,
-                                    _ => false,
-                                }
+                            .filter(|id| match (*id & 0x03, filter) {
+                                (0x00, (true, _, _, _))
+                                | (0x01, (_, true, _, _))
+                                | (0x02, (_, _, true, _))
+                                | (0x03, (_, _, _, true)) => true,
+                                _ => false,
                             })
                             .collect::<Vec<u64>>()
                     } else {
                         conn.quiche_conn
                             .readable()
-                            .filter(|id| {
-                                match (*id & 0x03, filter) {
-                                    (0x00, (true, _, _, _))
-                                    | (0x01, (_, true, _, _))
-                                    | (0x02, (_, _, true, _))
-                                    | (0x03, (_, _, _, true)) => true,
-                                    _ => false,
-                                }
+                            .filter(|id| match (*id & 0x03, filter) {
+                                (0x00, (true, _, _, _))
+                                | (0x01, (_, true, _, _))
+                                | (0x02, (_, _, true, _))
+                                | (0x03, (_, _, _, true)) => true,
+                                _ => false,
                             })
                             .collect::<Vec<u64>>()
                     };
@@ -719,22 +766,24 @@ impl QuicActor {
                             && addr.port() == local_addr.port()
                     })
                     .map(|(_, handle)| *handle);
-                let socket_handle = if let Some(socket_handle) = socket_handle {
-                    socket_handle
+                let (socket_handle, local_addr) = if let Some(socket_handle) = socket_handle {
+                    (socket_handle, local_addr)
                 } else {
                     let local_addr = if local_addr.is_ipv4() {
                         SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), local_addr.port())
                     } else {
                         SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), local_addr.port())
                     };
-                    match self.add_socket(local_addr).await {
+                    let (socket_handle, binded_local) = match self.add_socket(local_addr).await {
                         Ok(v) => v,
                         Err(e) => {
                             let _ =
                                 respond_to.send(Err(format!("get_binding failed: {:?}", e).into()));
                             return;
                         }
-                    }
+                    };
+                    let new_local_addr = SocketAddr::new(local_addr.ip(), binded_local.port());
+                    (socket_handle, new_local_addr)
                 };
                 let socket = self.sockets.get(&socket_handle).unwrap().clone();
 
@@ -744,7 +793,7 @@ impl QuicActor {
                     if conn.quiche_conn.available_dcids() > 0 {
                         match conn.quiche_conn.probe_path(local_addr, peer_addr) {
                             Ok(v) => {
-                                let _ = respond_to.send(Ok(v));
+                                let _ = respond_to.send(Ok((local_addr, v)));
                             }
                             Err(e) => {
                                 let _ = respond_to
@@ -962,6 +1011,8 @@ impl QuicActor {
                     }
                 }
             }
+        } else {
+            info!("No connection for conn_handle {}", conn_handle);
         }
     }
 
@@ -999,11 +1050,9 @@ impl QuicActor {
 
             for (conn_handle, conn) in self.conns.iter_mut() {
                 if conn.quiche_conn.is_established() {
-
                     if !conn.recv_stream_readness_requests.is_empty()
                         && conn.quiche_conn.readable().next().is_some()
                     {
-
                         conn.recv_stream_readness_requests.retain_mut(|request| {
                             let filter = request.filter.clone().expect("not filled");
                             let readable = if let Some(stream_ids) = &request.stream_ids {
@@ -1014,32 +1063,28 @@ impl QuicActor {
                                 stream_ids
                                     .intersection(&readable)
                                     .cloned()
-                                    .filter(|id| {
-                                        match (*id & 0x03, filter) {
-                                            (0x00, (true, _, _, _))
-                                            | (0x01, (_, true, _, _))
-                                            | (0x02, (_, _, true, _))
-                                            | (0x03, (_, _, _, true)) => true,
-                                            _ => false,
-                                        }
+                                    .filter(|id| match (*id & 0x03, filter) {
+                                        (0x00, (true, _, _, _))
+                                        | (0x01, (_, true, _, _))
+                                        | (0x02, (_, _, true, _))
+                                        | (0x03, (_, _, _, true)) => true,
+                                        _ => false,
                                     })
                                     .collect::<Vec<u64>>()
                             } else {
                                 conn.quiche_conn
                                     .readable()
-                                    .filter(|id| {
-                                        match (*id & 0x03, filter) {
-                                            (0x00, (true, _, _, _))
-                                            | (0x01, (_, true, _, _))
-                                            | (0x02, (_, _, true, _))
-                                            | (0x03, (_, _, _, true)) => true,
-                                            _ => false,
-                                        }
+                                    .filter(|id| match (*id & 0x03, filter) {
+                                        (0x00, (true, _, _, _))
+                                        | (0x01, (_, true, _, _))
+                                        | (0x02, (_, _, true, _))
+                                        | (0x03, (_, _, _, true)) => true,
+                                        _ => false,
                                     })
                                     .collect::<Vec<u64>>()
                             };
                             if !readable.is_empty() {
-                                if let Some(respond_to) =  request.respond_to.take() {
+                                if let Some(respond_to) = request.respond_to.take() {
                                     respond_to.send(Ok(readable)).ok();
                                 }
                                 false
@@ -1146,11 +1191,11 @@ impl QuicActor {
                                 .probe_path(request.local_addr, request.peer_addr)
                             {
                                 Ok(seq) => {
-                                    let _ = request.respond_to.send(Ok(seq));
+                                    let _ = request.respond_to.send(Ok((request.local_addr, seq)));
                                 }
                                 Err(e) => {
                                     let _ = request.respond_to.send(Err(format!(
-                                        "probe_path failed: {:?}",
+                                        "probe_path() failed: {:?}",
                                         e
                                     )
                                     .into()));
@@ -1192,7 +1237,15 @@ impl QuicActor {
                     }
                 }
             }
-            self.conns.retain(|_, ref mut c| !c.quiche_conn.is_closed());
+            self.conns.retain(|conn_handle, c| {
+                if !c.quiche_conn.is_closed() {
+                    return true;
+                }
+                self.conn_ids.retain(|_, conn_handle1| {
+                    *conn_handle != *conn_handle1
+                });
+                false
+            });
 
             if self.shutdown && self.conns.is_empty() {
                 info!("No connection exists.");
@@ -1293,10 +1346,15 @@ impl QuicHandle {
         }
     }
 
-    pub async fn connect(&self, url: url::Url) -> Result<QuicConnectionHandle> {
+    pub async fn connect(
+        &self,
+        url: url::Url,
+        local_addr: Option<SocketAddr>,
+    ) -> Result<QuicConnectionHandle> {
         let (send, recv) = oneshot::channel();
         let msg = ActorMessage::Connect {
             url,
+            local_addr,
             respond_to: send,
         };
         let _ = self.sender.send(msg).await;
@@ -1310,7 +1368,6 @@ impl QuicHandle {
     }
 }
 
-
 #[derive(Clone)]
 pub struct QuicConnectionHandle {
     sender: mpsc::Sender<ActorMessage>,
@@ -1318,9 +1375,7 @@ pub struct QuicConnectionHandle {
 }
 
 impl QuicConnectionHandle {
-    pub async fn wait_connected(
-        &self,
-    ) -> Result<()> {
+    pub async fn wait_connected(&self) -> Result<()> {
         let (send, recv) = oneshot::channel();
         let msg = ActorMessage::WaitConnected {
             conn_handle: self.conn_handle,
@@ -1511,7 +1566,7 @@ impl QuicConnectionHandle {
         recv.await.expect("Actor task has been killed")
     }
 
-    pub async fn probe_path(&self, local_addr: SocketAddr, peer_addr: SocketAddr) -> Result<u64> {
+    pub async fn probe_path(&self, local_addr: SocketAddr, peer_addr: SocketAddr) -> Result<(SocketAddr, u64)> {
         let (send, recv) = oneshot::channel();
         let msg = ActorMessage::ProbePath {
             conn_handle: self.conn_handle,
@@ -1731,8 +1786,11 @@ mod tests {
             .unwrap();
         let client = testing::open_client(shutdown_complete_tx.clone()).unwrap();
         let url = url::Url::parse("http://127.0.0.1:12345").unwrap();
-        let ret = client.connect(url).await;
-        assert_eq!(ret.is_ok(), true);
+        let res = client.connect(url, None).await;
+        assert_eq!(res.is_ok(), true);
+        let conn = res.unwrap();
+        let res = conn.wait_connected().await;
+        assert_eq!(res.is_ok(), true);
     }
 
     #[tokio::test]
@@ -1743,8 +1801,11 @@ mod tests {
             .unwrap();
         let client = testing::open_client(shutdown_complete_tx.clone()).unwrap();
         let url = url::Url::parse("http://[::1]:12346").unwrap();
-        let ret = client.connect(url).await;
-        assert_eq!(ret.is_ok(), true);
+        let res = client.connect(url, None).await;
+        assert_eq!(res.is_ok(), true);
+        let conn = res.unwrap();
+        let res = conn.wait_connected().await;
+        assert_eq!(res.is_ok(), true);
     }
 
     #[tokio::test]
@@ -1755,9 +1816,9 @@ mod tests {
             .unwrap();
         let client = testing::open_client(shutdown_complete_tx.clone()).unwrap();
         let url = url::Url::parse("http://127.0.0.1:12347").unwrap();
-        let _ = client.connect(url).await;
-        let ret = server.accept().await;
-        assert_eq!(ret.is_ok(), true);
+        let _ = client.connect(url, None).await;
+        let res = server.accept().await;
+        assert_eq!(res.is_ok(), true);
     }
 
     #[tokio::test]
@@ -1768,9 +1829,9 @@ mod tests {
             .unwrap();
         let client = testing::open_client(shutdown_complete_tx.clone()).unwrap();
         let url = url::Url::parse("http://[::1]:12348").unwrap();
-        let _ = client.connect(url).await;
-        let ret = server.accept().await;
-        assert_eq!(ret.is_ok(), true);
+        let _ = client.connect(url, None).await;
+        let res = server.accept().await;
+        assert_eq!(res.is_ok(), true);
     }
 
     #[tokio::test]
@@ -1781,7 +1842,8 @@ mod tests {
             .unwrap();
         let client = testing::open_client(shutdown_complete_tx.clone()).unwrap();
         let url = url::Url::parse("http://127.0.0.1:12349").unwrap();
-        let conn = client.connect(url).await.unwrap();
+        let conn = client.connect(url, None).await.unwrap();
+        conn.wait_connected().await.unwrap();
         let conn1 = server.accept().await.unwrap();
 
         let buf = Bytes::from("hello");
@@ -1821,7 +1883,8 @@ mod tests {
             .unwrap();
         let client = testing::open_client(shutdown_complete_tx.clone()).unwrap();
         let url = url::Url::parse("http://127.0.0.1:12349").unwrap();
-        let conn = client.connect(url).await.unwrap();
+        let conn = client.connect(url, None).await.unwrap();
+        conn.wait_connected().await.unwrap();
         let conn1 = server.accept().await.unwrap();
 
         tokio::task::spawn(async move {
@@ -1863,7 +1926,8 @@ mod tests {
             .unwrap();
         let client = testing::open_client(shutdown_complete_tx.clone()).unwrap();
         let url = url::Url::parse("http://127.0.0.1:12349").unwrap();
-        let conn = client.connect(url).await.unwrap();
+        let conn = client.connect(url, None).await.unwrap();
+        conn.wait_connected().await.unwrap();
         let conn1 = server.accept().await.unwrap();
 
         let buf = Bytes::from("hello");

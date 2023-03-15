@@ -213,7 +213,9 @@ async fn do_service(matches: &clap::ArgMatches) -> anyhow::Result<()> {
 
                         info!("Connecting to {}", &url);
                         let conn = quic
-                            .connect(url.clone())
+                            .connect(url.clone(),
+                                Some(SocketAddr::new(ipnet.addr(), 0))
+                            )
                             .await
                             .map_err(|e| anyhow!(e))
                             .context("connect()")?;

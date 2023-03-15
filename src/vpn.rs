@@ -324,7 +324,7 @@ impl PathManager {
 
         let mut count: usize = 0;
         for (local_addr, peer_addr) in paths.difference(&paths1) {
-            let seq = self
+            let (_, seq) = self
                 .conn
                 .probe_path(*local_addr, *peer_addr)
                 .await

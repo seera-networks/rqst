@@ -73,7 +73,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         let _shutdown_complete_tx1 = shutdown_complete_tx1;
 
         println!("connecting to {}", &url);
-        let conn = quic.connect(url).await.unwrap();
+        let conn = quic.connect(url, None).await.unwrap();
         tokio::select! {
             ret = conn.wait_connected() => {
                 match ret {
@@ -101,7 +101,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
             local_addr.set_port(local_addr.port() + 1);
             match conn.probe_path(local_addr, peer_addr).await {
-                Ok(seq) => {
+                Ok((_, seq)) => {
                     println!("probe_path: dcid seq={}", seq);
                 }
                 Err(e) => {
