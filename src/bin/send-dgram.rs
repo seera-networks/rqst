@@ -73,12 +73,12 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         let _shutdown_complete_tx1 = shutdown_complete_tx1;
 
         println!("connecting to {}", &url);
-        let conn = tokio::select! {
-            ret = quic.connect(url) => {
+        let conn = quic.connect(url).await.unwrap();
+        tokio::select! {
+            ret = conn.wait_connected() => {
                 match ret {
-                    Ok(conn) => {
+                    Ok(_) => {
                         println!("Connection established: {}", conn.conn_handle);
-                        conn
                    },
                    Err(e) => {
                        println!("connect failed: {:?}", e);

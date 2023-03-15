@@ -196,11 +196,11 @@ async fn do_service(matches: &clap::ArgMatches) -> anyhow::Result<()> {
     );
 
     info!("Connecting to {}", &url);
-    let conn = tokio::select! {
-        res = quic.connect(url) => {
-            let conn = res.map_err(|e| anyhow!(e)).context("connect()")?;
+    let conn = quic.connect(url).await.map_err(|e| anyhow!(e)).context("connect()")?;
+    tokio::select! {
+        res = conn.wait_connected() => {
+            res.map_err(|e| anyhow!(e)).context("wait_connected()")?;
             info!("Connection established: {}", conn.conn_handle);
-            conn
         },
         _ = tokio::signal::ctrl_c() => {
             info!("Control C signaled");

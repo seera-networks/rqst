@@ -55,6 +55,10 @@ enum ActorMessage {
         url: url::Url,
         respond_to: oneshot::Sender<Result<ConnectionHandle>>,
     },
+    WaitConnected {
+        conn_handle: ConnectionHandle,
+        respond_to: oneshot::Sender<Result<()>>,
+    },
     RecvStreamReadness {
         conn_handle: ConnectionHandle,
         stream_ids: Option<Vec<u64>>,
@@ -148,7 +152,7 @@ struct QuicConnection {
     quiche_conn: quiche::Connection,
     locals_to_sockets: HashMap<SocketAddr, Arc<UdpSocket>>,
     before_established: bool,
-    connect_request: Option<ConnectRequest>,
+    wait_connected_request: Option<VecDeque<WaitConnectedRequest>>,
     recv_stream_readness_requests: VecDeque<RecvStreamReadnessRequest>,
     send_stream_requests: BTreeMap<u64, VecDeque<SendStreamRequest>>,
     recv_dgram_readness_requests: VecDeque<RecvDgramReadnessRequest>,
@@ -164,8 +168,8 @@ struct AcceptRequest {
     respond_to: oneshot::Sender<Result<ConnectionHandle>>,
 }
 
-struct ConnectRequest {
-    respond_to: oneshot::Sender<Result<ConnectionHandle>>,
+struct WaitConnectedRequest {
+    respond_to: oneshot::Sender<Result<()>>,
 }
 
 struct RecvDgramReadnessRequest {
@@ -354,13 +358,14 @@ impl QuicActor {
                 let mut locals_to_sockets = HashMap::new();
                 locals_to_sockets.insert(send_info.from, socket.clone());
 
+                let conn_handle = self.next_conn_handle;
                 self.conns.insert(
-                    self.next_conn_handle,
+                    conn_handle,
                     QuicConnection {
                         quiche_conn: conn,
                         locals_to_sockets,
                         before_established: true,
-                        connect_request: Some(ConnectRequest { respond_to }),
+                        wait_connected_request: Some(VecDeque::new()),
                         recv_stream_readness_requests: VecDeque::new(),
                         send_stream_requests: BTreeMap::new(),
                         recv_dgram_readness_requests: VecDeque::new(),
@@ -370,8 +375,27 @@ impl QuicActor {
                         path_event_readness_requests: VecDeque::new(),
                     },
                 );
-                self.conn_ids.insert(scid, self.next_conn_handle);
-                self.next_conn_handle += 1;
+                self.conn_ids.insert(scid, conn_handle);
+                self.next_conn_handle = self.next_conn_handle.saturating_add(1);
+                respond_to.send(Ok(conn_handle)).ok();
+            }
+            ActorMessage::WaitConnected {
+                conn_handle,
+                respond_to,
+            } => {
+                if let Some(conn) = self.conns.get_mut(&conn_handle) {
+                    if conn.wait_connected_request.is_none() {
+                        let _ = respond_to.send(Err("connect() not called".into()));
+                        return;
+                    }
+                    if conn.quiche_conn.is_established() {
+                        respond_to.send(Ok(())).ok();
+                    } else {
+                        if let Some(queue) = &mut conn.wait_connected_request {
+                            queue.push_back(WaitConnectedRequest { respond_to });
+                        }
+                    }
+                }
             }
             ActorMessage::RecvStreamReadness {
                 conn_handle,
@@ -879,7 +903,7 @@ impl QuicActor {
                     quiche_conn: conn,
                     locals_to_sockets,
                     before_established: true,
-                    connect_request: None,
+                    wait_connected_request: None,
                     recv_stream_readness_requests: VecDeque::new(),
                     send_stream_requests: BTreeMap::new(),
                     recv_dgram_readness_requests: VecDeque::new(),
@@ -906,8 +930,10 @@ impl QuicActor {
 
             if conn.quiche_conn.is_established() {
                 if conn.before_established {
-                    if let Some(request) = conn.connect_request.take() {
-                        let _ = request.respond_to.send(Ok(conn_handle));
+                    if let Some(queue) = &mut conn.wait_connected_request {
+                        while let Some(request) = queue.pop_front() {
+                            let _ = request.respond_to.send(Ok(()));
+                        }
                     } else {
                         let res = conn.quiche_conn.peer_cert();
                         if self.client_cert_required && res.is_none() {
@@ -1178,8 +1204,10 @@ impl QuicActor {
 
 impl Drop for QuicConnection {
     fn drop(&mut self) {
-        if let Some(request) = self.connect_request.take() {
-            let _ = request.respond_to.send(Err("Connection closed".into()));
+        if let Some(mut queue) = self.wait_connected_request.take() {
+            for request in queue.drain(..) {
+                let _ = request.respond_to.send(Err("Connection closed".into()));
+            }
         }
         for request in self.recv_stream_readness_requests.drain(..) {
             if let Some(respond_to) = request.respond_to {
@@ -1282,6 +1310,7 @@ impl QuicHandle {
     }
 }
 
+
 #[derive(Clone)]
 pub struct QuicConnectionHandle {
     sender: mpsc::Sender<ActorMessage>,
@@ -1289,6 +1318,18 @@ pub struct QuicConnectionHandle {
 }
 
 impl QuicConnectionHandle {
+    pub async fn wait_connected(
+        &self,
+    ) -> Result<()> {
+        let (send, recv) = oneshot::channel();
+        let msg = ActorMessage::WaitConnected {
+            conn_handle: self.conn_handle,
+            respond_to: send,
+        };
+        let _ = self.sender.send(msg).await;
+        recv.await.expect("Actor task has been killed")
+    }
+
     pub async fn recv_stream_ready(
         &self,
         stream_ids: Option<Vec<u64>>,
