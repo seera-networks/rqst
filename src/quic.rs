@@ -288,7 +288,9 @@ impl QuicActor {
         match msg {
             ActorMessage::Accept { respond_to } => {
                 if let Some(conn_handle) = self.wait_conn_handles.pop_front() {
-                    let _ = respond_to.send(Ok(conn_handle));
+                    if let Err(Ok(conn_handle)) = respond_to.send(Ok(conn_handle)) {
+                        self.wait_conn_handles.push_front(conn_handle);
+                    }
                 } else {
                     self.accept_requests.push_back(AcceptRequest { respond_to });
                 }
@@ -913,9 +915,14 @@ impl QuicActor {
                                 .close(false, 0x1, b"client cert required")
                                 .ok();
                         } else {
-                            if let Some(request) = self.accept_requests.pop_front() {
-                                let _ = request.respond_to.send(Ok(conn_handle));
-                            } else {
+                            let mut accepted = false;
+                            while let Some(request) = self.accept_requests.pop_front() {
+                                if let Ok(_) = request.respond_to.send(Ok(conn_handle)) {
+                                    accepted = true;
+                                    break;
+                                }
+                            }
+                            if !accepted {
                                 self.wait_conn_handles.push_back(conn_handle);
                             }
                         }
