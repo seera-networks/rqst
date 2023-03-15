@@ -3,6 +3,7 @@ use flexi_logger::{detailed_format, FileSpec, Logger, WriteMode};
 use log::{error, info};
 use rqst::config::*;
 use rqst::ifwatch::{IfWatcherExt, IfEventExt};
+use ipnet::IpNet;
 use rqst::quic::*;
 use rqst::vpn::*;
 use std::collections::HashMap;
@@ -282,9 +283,50 @@ async fn do_service(matches: &clap::ArgMatches) -> anyhow::Result<()> {
         running_vpn = true;
     }
 
-    use ipnet::IpNet;
-    let exclude_ipnets: Vec<IpNet> = vec!["172.16.0.0/12".parse()?];
-    let mut ifwatcher = IfWatcherExt::new(exclude_ipnets, false)
+    let exclude_ipnets = client_config.exclude_ipv4net.exclude_ipnets
+        .iter()
+        .copied()
+        .map(|v| v.into())
+        .collect::<Vec<IpNet>>();
+
+    let include_ipnets = client_config.exclude_ipv4net.include_ipnets
+        .iter()
+        .copied()
+        .map(|v| v.into())
+        .collect::<Vec<IpNet>>();
+
+    let exclude_metered = client_config.exclude_iftypes
+        .iter()
+        .any(|v| {
+            if let ExcludeIfType::Metred = v {
+                true
+            } else {
+                false
+            }
+        });
+    let exclude_not_metered = client_config.exclude_iftypes
+        .iter()
+        .any(|v| {
+            if let ExcludeIfType::NotMetred = v {
+                true
+            } else {
+                false
+            }
+        });
+
+    info!("exclude ipv4net: {:?}, include ipv4net: {:?}, exclude_metered: {}, exclude_not_metered: {}",
+        exclude_ipnets,
+        include_ipnets,
+        exclude_metered,
+        exclude_not_metered
+    );
+
+    let ifwatcher = IfWatcherExt::new(
+        exclude_ipnets,
+        include_ipnets,
+        exclude_metered,
+        exclude_not_metered,
+    )
         .await
         .context("initialize IfWatcherExt")?;
 

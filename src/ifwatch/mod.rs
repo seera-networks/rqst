@@ -22,20 +22,26 @@ pub enum IfEventExt {
 pub struct IfWatcherExt {
     inner: IfWatcher,
     exclude_ipnets: Vec<IpNet>,
-    exclude_metred: bool,
+    include_ipnets: Vec<IpNet>,
+    exclude_metered: bool,
+    exclude_not_metered: bool,
     excluded: HashSet<IpNet>,
 }
 
 impl IfWatcherExt {
     pub async fn new(
         exclude_ipnets: Vec<IpNet>,
-        exclude_metred: bool,
+        include_ipnets: Vec<IpNet>,
+        exclude_metered: bool,
+        exclude_not_metered: bool,
     ) -> anyhow::Result<Self> {
         let ifwatcher = IfWatcher::new().await.context("initialize IfWatcher")?;
         Ok(IfWatcherExt {
             inner: ifwatcher,
             exclude_ipnets,
-            exclude_metred,
+            include_ipnets,
+            exclude_metered,
+            exclude_not_metered,
             excluded: HashSet::new(),
         })
     }
@@ -53,12 +59,19 @@ impl IfWatcherExt {
                         .find(|exclude| {
                             exclude.contains(&ipnet)
                         });
-                    if excluded.is_none() {
+                    let included = self.include_ipnets
+                        .iter()
+                        .find(|include| {
+                            include.contains(&ipnet)
+                        });
+
+                    if excluded.is_none() || included.is_some() {
                         let metered = is_metered(ipnet.addr())
                             .await
                             .context("is_metered()");
                         let metered = metered?;
-                        if !self.exclude_metred || !metered {
+                        if (metered && !self.exclude_metered) ||
+                            (!metered && !self.exclude_not_metered) {
                             return Ok(IfEventExt::Up((ipnet, metered)));
                         }
                     }

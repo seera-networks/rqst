@@ -23,13 +23,39 @@ name = "not-metered"
 iftype = "not-metered"
 
 [[tunnels]]
+dscp = 0
+path-group = "not-metered"
+
+[[tunnels]]
+dscp = 40
+path-group = "not-metered"
+
+[[tunnels]]
 dscp = 56
 path-group = "metered"
+
+[exclude-ipv4net]
+exclude-ipnets = ["127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
+include-ipnets = ["192.168.1.0/24"]
+
+[[exclude-iftypes]]
+iftype = "metered"
 
 "#;
 
 fn default_ipv4net() -> Ipv4Net {
     Ipv4Net::from_str("0.0.0.0/0").unwrap()
+}
+
+fn default_ipv4nets() -> Vec<Ipv4Net> {
+    Vec::new()
+}
+
+fn default_exclude_ipv4net() -> ExcludeIpv4Net {
+    ExcludeIpv4Net {
+        exclude_ipnets: Vec::new(),
+        include_ipnets: Vec::new(),   
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -39,6 +65,12 @@ pub struct ClientConfig {
 
     #[serde(default)]
     pub tunnels: Vec<Tunnel>,
+
+    #[serde(rename = "exclude-ipv4net", default = "default_exclude_ipv4net")]
+    pub exclude_ipv4net: ExcludeIpv4Net,
+
+    #[serde(rename = "exclude-iftypes", default)]
+    pub exclude_iftypes: Vec<ExcludeIfType>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -90,6 +122,25 @@ pub struct Tunnel {
     pub path_group: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExcludeIpv4Net {
+    #[serde(rename = "exclude-ipnets", default = "default_ipv4nets")]
+    pub exclude_ipnets: Vec<Ipv4Net>,
+    #[serde(rename = "include-ipnets", default = "default_ipv4nets")]
+    pub include_ipnets: Vec<Ipv4Net>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "iftype", deny_unknown_fields)]
+pub enum ExcludeIfType {
+    #[serde(rename = "metered")]
+    Metred,
+
+    #[serde(rename = "not-metered")]
+    NotMetred,
+}
+
 mod test {
     use super::*;
 
@@ -109,6 +160,11 @@ mod test {
         [[tunnels]]
         dscp = 56
         path-group = "localnet"
+        [exclude-ipv4net]
+        exclude-ipnets = ["127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
+        include-ipnets = ["192.168.1.0/24"]
+        [[exclude-iftypes]]
+        iftype = "metered"
     "#;
 
     #[test]
@@ -139,6 +195,25 @@ mod test {
                     path_group: "localnet".to_string(),
                 },
             ]
+        );
+
+        assert_eq!(
+            cfg.exclude_ipv4net,
+            ExcludeIpv4Net {
+                exclude_ipnets: vec![
+                    Ipv4Net::from_str("127.0.0.0/8").unwrap(),
+                    Ipv4Net::from_str("10.0.0.0/8").unwrap(),
+                    Ipv4Net::from_str("172.16.0.0/12").unwrap(),
+                    Ipv4Net::from_str("192.168.0.0/16").unwrap(),
+                ],
+                include_ipnets: vec![
+                    Ipv4Net::from_str("192.168.1.0/24").unwrap(),
+                ]
+            }
+        );
+        assert_eq!(
+            cfg.exclude_iftypes,
+            vec![ExcludeIfType::Metred]
         );
     }
 }
