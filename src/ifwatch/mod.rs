@@ -46,6 +46,10 @@ impl IfWatcherExt {
         })
     }
 
+    pub fn iter(&self) -> impl Iterator<Item = &IpNet> {
+        self.inner.iter()
+    }
+
     // Not cancel-safe
     pub async fn pop(&mut self) -> anyhow::Result<IfEventExt> {
         loop {

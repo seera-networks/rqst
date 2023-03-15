@@ -1,18 +1,18 @@
 use anyhow::{anyhow, Context};
 use flexi_logger::{detailed_format, FileSpec, Logger, WriteMode};
+use ipnet::IpNet;
 use log::{error, info};
 use rqst::config::*;
-use rqst::ifwatch::{IfWatcherExt, IfEventExt};
-use ipnet::IpNet;
+use rqst::ifwatch::{IfEventExt, IfWatcherExt};
 use rqst::quic::*;
 use rqst::vpn::*;
 use std::collections::HashMap;
-use std::net::SocketAddr;
 use std::env;
 use std::io::prelude::*;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use tokio::sync::{broadcast, mpsc};
-use tokio::task::JoinSet;
+use tokio::task::{JoinHandle, JoinSet};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -184,6 +184,10 @@ async fn do_service(matches: &clap::ArgMatches) -> anyhow::Result<()> {
     let cpus = num_cpus::get();
     info!("logical cores: {}", cpus);
 
+    let (mut watch_ipchange_handle, mut notify_ipchange_rx) = start_watch_ipchange(&client_config)
+        .await
+        .context("initialize ifwatcher")?;
+
     let (notify_shutdown_tx, _) = broadcast::channel(1);
     let (shutdown_complete_tx, mut shutdown_complete_rx) = mpsc::channel(1);
 
@@ -196,7 +200,11 @@ async fn do_service(matches: &clap::ArgMatches) -> anyhow::Result<()> {
     );
 
     info!("Connecting to {}", &url);
-    let conn = quic.connect(url).await.map_err(|e| anyhow!(e)).context("connect()")?;
+    let conn = quic
+        .connect(url)
+        .await
+        .map_err(|e| anyhow!(e))
+        .context("connect()")?;
     tokio::select! {
         res = conn.wait_connected() => {
             res.map_err(|e| anyhow!(e)).context("wait_connected()")?;
@@ -242,11 +250,12 @@ async fn do_service(matches: &clap::ArgMatches) -> anyhow::Result<()> {
             if let Some(group_id) = pathmng.names_to_path_groups.get(&tunnel.path_group) {
                 if !tunnel.dscp.is_empty() {
                     return Some(
-                        tunnel.dscp
+                        tunnel
+                            .dscp
                             .iter()
                             .copied()
                             .map(|v| (v, *group_id))
-                            .collect::<Vec<(u8, u64)>>()
+                            .collect::<Vec<(u8, u64)>>(),
                     );
                 }
             }
@@ -278,72 +287,6 @@ async fn do_service(matches: &clap::ArgMatches) -> anyhow::Result<()> {
     }
 
     let (notify_tunnel_tx, _) = broadcast::channel::<HashMap<u8, u64>>(100);
-
-    let mut exclude_ipnets = client_config.exclude_ipv4net.exclude_ipnets
-        .iter()
-        .copied()
-        .map(|v| v.into())
-        .collect::<Vec<IpNet>>();
-    let mut exclude_ipv6nets = client_config.exclude_ipv6net.exclude_ipnets
-        .iter()
-        .copied()
-        .map(|v| v.into())
-        .collect::<Vec<IpNet>>();
-    exclude_ipnets.append(&mut exclude_ipv6nets);
-
-    let mut include_ipnets = client_config.exclude_ipv4net.include_ipnets
-        .iter()
-        .copied()
-        .map(|v| v.into())
-        .collect::<Vec<IpNet>>();
-    let mut include_ipv6nets = client_config.exclude_ipv6net.include_ipnets
-        .iter()
-        .copied()
-        .map(|v| v.into())
-        .collect::<Vec<IpNet>>();
-    include_ipnets.append(&mut include_ipv6nets);
-
-    let exclude_metered = client_config.exclude_iftype.iftypes
-        .iter()
-        .any(|v| {
-            if let IfType::Metered = v {
-                true
-            } else {
-                false
-            }
-        });
-    let exclude_not_metered = client_config.exclude_iftype.iftypes
-        .iter()
-        .any(|v| {
-            if let IfType::NotMetered = v {
-                true
-            } else {
-                false
-            }
-        });
-
-    info!("exclude ipnet: {:?}, include ipnet: {:?}, exclude_metered: {}, exclude_not_metered: {}",
-        exclude_ipnets,
-        include_ipnets,
-        exclude_metered,
-        exclude_not_metered
-    );
-
-    let ifwatcher = IfWatcherExt::new(
-        exclude_ipnets,
-        include_ipnets,
-        exclude_metered,
-        exclude_not_metered,
-    )
-        .await
-        .context("initialize IfWatcherExt")?;
-
-    let (notify_ipchange_tx, mut notify_ipchange_rx) = mpsc::channel(1);
-
-    let ipwatch_handle = tokio::task::spawn(watch_ipchange(
-        ifwatcher,
-        notify_ipchange_tx,
-    ));
 
     if !running_vpn {
         start_vpn(
@@ -429,7 +372,7 @@ async fn do_service(matches: &clap::ArgMatches) -> anyhow::Result<()> {
                         Ok(res) => {
                             if let Err(e) = res {
                                 error!("Error occured in spawned task: {:?}", e);
-                            }        
+                            }
                         }
                         Err(e) => {
                             error!("Spawned task aborted: {:?}", e);
@@ -440,7 +383,7 @@ async fn do_service(matches: &clap::ArgMatches) -> anyhow::Result<()> {
 
             _ = tokio::signal::ctrl_c() => {
                 info!("Ctrl-C signaled");
-                ipwatch_handle.abort();
+                watch_ipchange_handle.abort();
                 drop(notify_shutdown_tx);
                 break;
             }
@@ -470,14 +413,14 @@ async fn do_service(matches: &clap::ArgMatches) -> anyhow::Result<()> {
             Ok(res) => {
                 if let Err(e) = res {
                     error!("Error occured in spawned task: {:?}", e);
-                }        
+                }
             }
             Err(e) => {
                 error!("Spawned task aborted: {:?}", e);
             }
         }
     }
-    match ipwatch_handle.await {
+    match watch_ipchange_handle.await {
         Ok(res) => {
             if let Err(e) = res {
                 error!("Error occured in watch_ipchange(): {:?}", e);
@@ -558,16 +501,86 @@ async fn notify_tunnel(
     Ok(())
 }
 
+async fn start_watch_ipchange(
+    client_config: &ClientConfig,
+) -> anyhow::Result<(JoinHandle<anyhow::Result<()>>, mpsc::Receiver<IfEventExt>)> {
+    let mut exclude_ipnets = client_config
+        .exclude_ipv4net
+        .exclude_ipnets
+        .iter()
+        .copied()
+        .map(|v| v.into())
+        .collect::<Vec<IpNet>>();
+    let mut exclude_ipv6nets = client_config
+        .exclude_ipv6net
+        .exclude_ipnets
+        .iter()
+        .copied()
+        .map(|v| v.into())
+        .collect::<Vec<IpNet>>();
+    exclude_ipnets.append(&mut exclude_ipv6nets);
+
+    let mut include_ipnets = client_config
+        .exclude_ipv4net
+        .include_ipnets
+        .iter()
+        .copied()
+        .map(|v| v.into())
+        .collect::<Vec<IpNet>>();
+    let mut include_ipv6nets = client_config
+        .exclude_ipv6net
+        .include_ipnets
+        .iter()
+        .copied()
+        .map(|v| v.into())
+        .collect::<Vec<IpNet>>();
+    include_ipnets.append(&mut include_ipv6nets);
+
+    let exclude_metered = client_config.exclude_iftype.iftypes.iter().any(|v| {
+        if let IfType::Metered = v {
+            true
+        } else {
+            false
+        }
+    });
+    let exclude_not_metered = client_config.exclude_iftype.iftypes.iter().any(|v| {
+        if let IfType::NotMetered = v {
+            true
+        } else {
+            false
+        }
+    });
+
+    info!(
+        "exclude ipnet: {:?}, include ipnet: {:?}, exclude_metered: {}, exclude_not_metered: {}",
+        exclude_ipnets, include_ipnets, exclude_metered, exclude_not_metered
+    );
+
+    let ifwatcher = IfWatcherExt::new(
+        exclude_ipnets,
+        include_ipnets,
+        exclude_metered,
+        exclude_not_metered,
+    )
+    .await
+    .context("initialize IfWatcherExt")?;
+
+    let (notify_ipchange_tx, notify_ipchange_rx) = mpsc::channel(1);
+
+    let ipwatch_handle = tokio::task::spawn(watch_ipchange(ifwatcher, notify_ipchange_tx));
+
+    Ok((ipwatch_handle, notify_ipchange_rx))
+}
+
 async fn watch_ipchange(
     mut ifwatcher: IfWatcherExt,
-    notify_ipchange_tx: mpsc::Sender<IfEventExt>
+    notify_ipchange_tx: mpsc::Sender<IfEventExt>,
 ) -> anyhow::Result<()> {
     info!("Enter watch_ipchange's loop");
     loop {
-        let event = ifwatcher.pop()
-            .await
-            .context("IfWatcherExt::pop")?;
-        notify_ipchange_tx.send(event)
+        let event = ifwatcher.pop().await.context("IfWatcherExt::pop")?;
+        notify_ipchange_tx
+            .send(event)
             .await
             .context("send ipchange event")?;
     }
