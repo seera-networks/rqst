@@ -61,12 +61,12 @@ impl IfWatcherExt {
                     let excluded = self.exclude_ipnets
                         .iter()
                         .find(|exclude| {
-                            exclude.contains(&ipnet)
+                            exclude.contains(&ipnet.addr())
                         });
                     let included = self.include_ipnets
                         .iter()
                         .find(|include| {
-                            include.contains(&ipnet)
+                            include.contains(&ipnet.addr())
                         });
 
                     if excluded.is_none() || included.is_some() {

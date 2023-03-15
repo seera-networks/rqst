@@ -371,7 +371,6 @@ impl QuicActor {
                 if from.port() == 0 {
                     from.set_port(binded_local.port());
                 }
-                info!("from: {}, binded_local: {}", from, binded_local);
                 
                 // Generate a random source connection ID for the connection.
                 let mut scid = [0; quiche::MAX_CONN_ID_LEN];
@@ -402,9 +401,14 @@ impl QuicActor {
                 let (write, send_info) = conn.send(&mut self.out).expect("initial send failed");
 
                 let socket = self.sockets.get(&socket_handle).unwrap();
-                let _written = send_sas(socket, &self.out[..write], &send_info.to, &send_info.from)
+                match send_sas(socket, &self.out[..write], &send_info.to, &send_info.from)
                     .await
-                    .unwrap();
+                {
+                    Ok(_) => {},
+                    Err(e) => {
+                        error!("send_sas() failed: {:?}", e);
+                    }
+                }
 
                 let mut locals_to_sockets = HashMap::new();
                 locals_to_sockets.insert(send_info.from, socket.clone());
@@ -1232,7 +1236,7 @@ impl QuicActor {
                             trace!("{} written {} bytes", conn.quiche_conn.trace_id(), written);
                         }
                         Err(e) => {
-                            error!("{} send_to() failed: {:?}", conn.quiche_conn.trace_id(), e);
+                            error!("{} send_sas() failed: {:?}", conn.quiche_conn.trace_id(), e);
                         }
                     }
                 }

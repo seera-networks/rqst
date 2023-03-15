@@ -226,7 +226,7 @@ async fn do_service(matches: &clap::ArgMatches) -> anyhow::Result<()> {
                                 res = conn.wait_connected() => {
                                     match res {
                                         Ok(_) => {
-                                            info!("Connection using {} established: {}", ipnet, conn.conn_handle);
+                                            info!("Connection using {} established: {}", ipnet.addr(), conn.conn_handle);
                                             yield Ok(conn);
                                         }
                                         Err(e) => {
@@ -235,7 +235,7 @@ async fn do_service(matches: &clap::ArgMatches) -> anyhow::Result<()> {
                                     }
                                 }
                                 _ = notify_shutdown_rx.recv() => {
-                                    info!("Connection using {} canceled: {}", ipnet, conn.conn_handle);
+                                    info!("Connection using {} canceled: {}", ipnet.addr(), conn.conn_handle);
                                     if let Err(e) = conn.close().await {
                                         error!("Error occured in conn.close(): {:?}", e);
                                     }
@@ -243,7 +243,7 @@ async fn do_service(matches: &clap::ArgMatches) -> anyhow::Result<()> {
                                 }
                             }
                         }) as Pin<Box<dyn Stream<Item = anyhow::Result<QuicConnectionHandle>> + Send>>;
-                        stream_map.insert(ipnet, stream);
+                        stream_map.insert(ipnet.addr(), stream);
                     }
                     IfEventExt::Down(ipnet) => {
                         info!("Local address {} down", ipnet);
@@ -252,12 +252,12 @@ async fn do_service(matches: &clap::ArgMatches) -> anyhow::Result<()> {
             }
 
             res = stream_map.next(), if !stream_map.is_empty() => {
-                let (ipnet, res) = res.context("StreamMap::next()")?;
+                let (ipaddr, res) = res.context("StreamMap::next()")?;
                 match res {
                     Ok(conn) => {
                         info!("Connection established: {}", conn.conn_handle);
                         conns.push(conn);
-                        stream_map.remove(&ipnet);
+                        stream_map.remove(&ipaddr);
                         drop(notify_shutdown_tx);
                         break;
                     }
@@ -277,8 +277,8 @@ async fn do_service(matches: &clap::ArgMatches) -> anyhow::Result<()> {
             },
         }
     }
-    while let Some((ipnet, _)) = stream_map.next().await {
-        stream_map.remove(&ipnet);
+    while let Some((ipaddr, _)) = stream_map.next().await {
+        stream_map.remove(&ipaddr);
     }
     let conn = conns.pop().expect("no conn");
  
