@@ -7,6 +7,11 @@ name = "localnet"
 ipnet = "192.168.1.0/24"
 
 [[path-groups]]
+kind = "ipv4net"
+name = "lte"
+ipnet = "192.168.179.0/24"
+
+[[path-groups]]
 kind = "iftype"
 name = "metered"
 iftype = "metered"
@@ -30,7 +35,7 @@ path-group = "metered"
 
 [exclude-ipv4net]
 exclude-ipnets = ["127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
-include-ipnets = ["192.168.1.0/24"]
+include-ipnets = ["192.168.1.0/24", "192.168.179.0/24"]
 
 [exclude-ipv6net]
 exclude-ipnets = ["::1/128", "fe80::/64"]

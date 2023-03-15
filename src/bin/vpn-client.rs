@@ -7,6 +7,7 @@ use ipnet::IpNet;
 use rqst::quic::*;
 use rqst::vpn::*;
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::env;
 use std::io::prelude::*;
 use std::path::PathBuf;
@@ -220,14 +221,15 @@ async fn do_service(matches: &clap::ArgMatches) -> anyhow::Result<()> {
         .context("path_stats()")?;
 
     assert_eq!(paths.len(), 1);
-    let mut local_addr = paths[0].local_addr;
+    let first_local_addr = paths[0].local_addr;
     let peer_addr = paths[0].peer_addr;
+    let local_port = first_local_addr.port();
 
-    pathmng.register_local_addr(local_addr, false);
+    pathmng.register_local_addr(first_local_addr, false);
     pathmng.register_peer_addr(peer_addr);
 
     pathmng
-        .set_group(local_addr)
+        .set_group(first_local_addr)
         .await
         .context("insert path into group")?;
 
@@ -249,10 +251,11 @@ async fn do_service(matches: &clap::ArgMatches) -> anyhow::Result<()> {
 
     let tunnelmng = TunnelManager::new(conn.clone(), tunnels.clone());
 
-    {
-        local_addr.set_port(local_addr.port() + 1);
+    if false {
+        let mut second_local_addr = first_local_addr;
+        second_local_addr.set_port(first_local_addr.port() + 1);
 
-        pathmng.register_local_addr(local_addr, true);
+        pathmng.register_local_addr(second_local_addr, true);
 
         pathmng.probe().await.context("probing new path")?;
     }
@@ -267,21 +270,6 @@ async fn do_service(matches: &clap::ArgMatches) -> anyhow::Result<()> {
     }
 
     let (notify_tunnel_tx, _) = broadcast::channel::<HashMap<u8, u64>>(100);
-
-    if !running_vpn {
-        start_vpn(
-            &conn,
-            &mut ctrlmng,
-            &mut set,
-            &notify_shutdown_tx,
-            &notify_tunnel_tx,
-            shutdown_complete_tx.clone(),
-            matches.is_present("pktlog"),
-        )
-        .await
-        .context("start vpn")?;
-        running_vpn = true;
-    }
 
     let mut exclude_ipnets = client_config.exclude_ipv4net.exclude_ipnets
         .iter()
@@ -349,11 +337,36 @@ async fn do_service(matches: &clap::ArgMatches) -> anyhow::Result<()> {
         notify_ipchange_tx,
     ));
 
+    if !running_vpn {
+        start_vpn(
+            &conn,
+            &mut ctrlmng,
+            &mut set,
+            &notify_shutdown_tx,
+            &notify_tunnel_tx,
+            shutdown_complete_tx.clone(),
+            matches.is_present("pktlog"),
+        )
+        .await
+        .context("start vpn")?;
+        running_vpn = true;
+    }
+
     loop {
         tokio::select! {
             res = notify_ipchange_rx.recv() => {
                 let event = res.context("recv ipchange event")?;
-                info!("{:?}", event);
+                match event {
+                    IfEventExt::Up((ipnet, metered)) => {
+                        info!("Local address {}(metered: {}) up", ipnet, metered);
+                        let new_local_addr = SocketAddr::new(ipnet.addr(), local_port);
+                        pathmng.register_local_addr(new_local_addr, metered);
+                        pathmng.probe().await.context("probing new path")?;
+                    }
+                    IfEventExt::Down(ipnet) => {
+                        info!("Local address {} down", ipnet);
+                    }
+                }
             }
             res = conn.path_event() => {
                 let event = res.map_err(|e| anyhow!(e))
