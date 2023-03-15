@@ -10,7 +10,7 @@ use self::windows::*;
 use anyhow::{anyhow, Context};
 use if_watch::{IfEvent, IfWatcher};
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
-use std::collections::HashSet;
+use std::collections::{HashSet, HashMap};
 use std::pin::Pin;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -25,6 +25,7 @@ pub struct IfWatcherExt {
     include_ipnets: Vec<IpNet>,
     exclude_metered: bool,
     exclude_not_metered: bool,
+    included: HashMap<IpNet, bool>,
     excluded: HashSet<IpNet>,
 }
 
@@ -42,12 +43,13 @@ impl IfWatcherExt {
             include_ipnets,
             exclude_metered,
             exclude_not_metered,
+            included: HashMap::new(),
             excluded: HashSet::new(),
         })
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = &IpNet> {
-        self.inner.iter()
+    pub fn iter(&self) -> impl Iterator<Item = (&IpNet, &bool)> {
+        self.included.iter()
     }
 
     // Not cancel-safe
@@ -75,7 +77,10 @@ impl IfWatcherExt {
                             .context("is_metered()");
                         let metered = metered?;
                         if (metered && !self.exclude_metered) ||
-                            (!metered && !self.exclude_not_metered) {
+                            (!metered && !self.exclude_not_metered)
+                        {
+                            self.included.insert(ipnet, metered);
+    
                             return Ok(IfEventExt::Up((ipnet, metered)));
                         }
                     }
@@ -84,6 +89,9 @@ impl IfWatcherExt {
                 IfEvent::Down(ipnet) => {
                     if self.excluded.contains(&ipnet) {
                         self.excluded.remove(&ipnet);
+                    }
+                    if self.included.contains_key(&ipnet) {
+                        self.included.remove(&ipnet);
                     }
                     return Ok(IfEventExt::Down(ipnet));
                 }

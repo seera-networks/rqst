@@ -17,12 +17,16 @@ iftypes = ["metered"]
 dscp = [0, 40]
 path-group = "localnet-not-metered"
 
+[[tunnels]]
+dscp = [56]
+path-group = "localnet"
+
 [exclude-ipv4net]
 exclude-ipnets = ["127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
-include-ipnets = ["192.168.1.0/24"]
+include-ipnets = ["192.168.1.0/24", "192.168.179.0/24"]
 
 [exclude-ipv6net]
 exclude-ipnets = ["::1/128", "fe80::/64"]
 
 [exclude-iftype]
-iftypes = ["metered"]
+iftypes = []
