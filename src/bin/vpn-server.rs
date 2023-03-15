@@ -410,7 +410,7 @@ async fn process_client(
                 let readable = res.map_err(|e| anyhow!(e))
                     .context("check stream's readness")?;
                 for stream_id in readable {
-                    println!("stream: {}", stream);
+                    println!("stream: {}", stream_id);
                     match ctrlmng.recv_request(&conn, stream_id).await
                         .with_context(|| format!("receive and parse request in {} stream", stream_id))?
                     {
