@@ -1,28 +1,40 @@
 ## Configuration for rqst VPN client
 
+# 使用しないローカルのネットワークのIPv4アドレスを指定
+[exclude-ipv4net]
+# loopbackアドレスとprivateアドレスは一旦すべて除外
+exclude-ipnets = ["127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
+# NAT配下で用いているPrivateアドレスを含める
+include-ipnets = ["192.168.1.0/24", "192.168.179.0/24"]
+
+# 使用しないローカルのネットワークのIPv6アドレスを指定
+[exclude-ipv6net]
+# loopbackアドレスとlink localアドレスは除外
+exclude-ipnets = ["::1/128", "fe80::/64"]
+
+# 使用しないローカルのネットワークを指定（そのネットワークに属するIPv4・IPv6アドレスが除外される）
+[exclude-iftype]
+# 指定できるのは、"metered"または"not-metered"
+iftypes = ["metered"]
+
+# 以下で3つのパスグループを定義する
 [[path-groups]]
+# nameはこのパスグループの名前を指定。tunnelsエントリで用いる
 name = "localnet"
 ipnets = ["192.168.1.0/24", "192.168.179.0/24", "2001:db8::/32"]
 
 [[path-groups]]
 name = "localnet-not-metered"
 ipnets = ["192.168.1.0/24", "192.168.179.0/24", "2001:db8::/32"]
+# "localnet"のアドレス範囲に加えて、ローカルネットワークが従量課金でないことを指定
 iftypes = ["not-metered"]
 
 [[path-groups]]
 name = "any-metered"
+# 従量課金のネットワークであればどのアドレスでも含める
 iftypes = ["metered"]
 
+# DSCPフィールドが0または40であるIPパケットは"localnet-not-metered"パスグループで送受信
 [[tunnels]]
 dscp = [0, 40]
 path-group = "localnet-not-metered"
-
-[exclude-ipv4net]
-exclude-ipnets = ["127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
-include-ipnets = ["192.168.1.0/24"]
-
-[exclude-ipv6net]
-exclude-ipnets = ["::1/128", "fe80::/64"]
-
-[exclude-iftype]
-iftypes = ["metered"]
