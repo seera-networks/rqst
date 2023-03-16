@@ -4,7 +4,7 @@ use crate::tap::Tap;
 use anyhow::{anyhow, Context};
 use bytes::{BufMut, BytesMut};
 use etherparse::{IpHeader, PacketHeaders};
-use pcap_file::pcap::PcapWriter;
+use pcap_file::pcap::{PcapPacket, PcapWriter};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{File, OpenOptions};
@@ -536,10 +536,8 @@ async fn remote_to_local(
                             if let Some(pcap_writer) = &pcap_writer {
                                 if let Ok(mut pcap_writer) = pcap_writer.lock() {
                                     let time = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap();
-                                    let ts_sec = time.as_secs().try_into().unwrap();
-                                    let ts_nsec = time.subsec_nanos();
                                     let orig_len = buf.len().try_into().unwrap();
-                                    pcap_writer.write(ts_sec, ts_nsec, &buf[..], orig_len).unwrap();
+                                    pcap_writer.write_packet(&PcapPacket::new(time, orig_len, &buf[..])).unwrap();
                                 }
                             }
 
@@ -616,10 +614,8 @@ async fn local_to_remote(
                         if let Some(pcap_writer) = &pcap_writer {
                             if let Ok(mut pcap_writer) = pcap_writer.lock() {
                                 let time = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap();
-                                let ts_sec = time.as_secs().try_into().unwrap();
-                                let ts_nsec = time.subsec_nanos();
                                 let orig_len = buf.len().try_into().unwrap();
-                                pcap_writer.write(ts_sec, ts_nsec, &buf[..], orig_len).unwrap();
+                                pcap_writer.write_packet(&PcapPacket::new(time, orig_len, &buf[..])).unwrap();
                             }
                         }
                         let buf = buf.freeze();

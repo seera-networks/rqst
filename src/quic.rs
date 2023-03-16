@@ -10,7 +10,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_stream::{Stream, StreamExt, StreamMap};
 
 use ring::rand::*;
-use std::net::{SocketAddr, ToSocketAddrs};
+use std::net::SocketAddr;
 
 use crate::sas::{bind_sas, select_local_ipaddr, send_sas, try_recv_sas};
 
@@ -315,14 +315,14 @@ impl QuicActor {
                 respond_to,
             } => {
                 let (to, mut from) = if let Some(local_addr) = local_addr {
-                    let to = match url.to_socket_addrs() {
-                        Ok(mut addrs) => {
-                            let addr = addrs.find(|v|
+                    let to = match url.socket_addrs(|| None) {
+                        Ok(addrs) => {
+                            let addr = addrs.iter().find(|v|
                                 v.is_ipv4() == local_addr.is_ipv4() ||
                                 v.is_ipv6() == local_addr.is_ipv6()
                             );
                             if let Some(addr) = addr {
-                                addr
+                                addr.clone()
                             } else {
                                 let _ = respond_to.send(Err(format!("No address for {:?}", url).into()));
                                 return;
@@ -335,10 +335,10 @@ impl QuicActor {
                     };
                     (to, local_addr)
                 } else {
-                    let to = match url.to_socket_addrs() {
-                        Ok(mut addrs) => {
-                            if let Some(addr) = addrs.next() {
-                                addr
+                    let to = match url.socket_addrs(|| None) {
+                        Ok(addrs) => {
+                            if let Some(addr) = addrs.iter().next() {
+                                addr.clone()
                             } else {
                                 let _ = respond_to.send(Err(format!("No address for {:?}", url).into()));
                                 return;

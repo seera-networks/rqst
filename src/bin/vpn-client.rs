@@ -182,9 +182,6 @@ async fn do_service(matches: &clap::ArgMatches) -> anyhow::Result<()> {
     let client_config: ClientConfig =
         toml::from_str(&config_toml).context("parse client config")?;
 
-    let cpus = num_cpus::get();
-    info!("logical cores: {}", cpus);
-
     let (watch_ipchange_handle, mut notify_ipchange_rx) = start_watch_ipchange(&client_config)
         .await
         .context("initialize ifwatcher")?;

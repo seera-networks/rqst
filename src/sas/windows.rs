@@ -159,7 +159,7 @@ pub fn try_recv_sas(
                             sin_port: 0,
                             sin_zero: [0u8; 8],
                         };
-                        let (_, address) = socket2::SockAddr::init(|addr_storage, len| {
+                        let (_, address) = socket2::SockAddr::try_init(|addr_storage, len| {
                             *len = mem::size_of_val(&destination) as _;
                             std::ptr::copy_nonoverlapping(&destination, addr_storage as _, 1);
                             Ok(())
@@ -174,7 +174,7 @@ pub fn try_recv_sas(
                         let mut destination: SOCKADDR_IN6 = mem::zeroed();
                         destination.sin6_family = AF_INET6 as _;
                         destination.sin6_addr = info.ipi6_addr;
-                        let (_, address) = socket2::SockAddr::init(|addr_storage, len| {
+                        let (_, address) = socket2::SockAddr::try_init(|addr_storage, len| {
                             *len = mem::size_of_val(&destination) as _;
                             std::ptr::copy_nonoverlapping(&destination, addr_storage as _, 1);
                             Ok(())
@@ -185,7 +185,7 @@ pub fn try_recv_sas(
                 }
             }
             let source_address = unsafe {
-                let (_, address) = socket2::SockAddr::init(|addr_storage, len| {
+                let (_, address) = socket2::SockAddr::try_init(|addr_storage, len| {
                     *len = mem::size_of_val(&source) as _;
                     ptr::copy_nonoverlapping(&source, addr_storage as _, 1);
                     Ok(())
@@ -227,7 +227,7 @@ pub fn try_send_sas(
         dwFlags: 0,
     };
 
-    match local.family() as u32 {
+    match local.family() {
         AF_INET => {
             let local: SOCKADDR_IN = unsafe { ptr::read(local.as_ptr() as _) };
             let info = IN_PKTINFO {

@@ -326,9 +326,6 @@ async fn tokio_main(
         config.log_keys();
     }
 
-    let cpus = num_cpus::get();
-    info!("logical cores: {}", cpus);
-
     let (notify_shutdown, _) = broadcast::channel(1);
     let (shutdown_complete_tx, mut shutdown_complete_rx) = mpsc::channel(1);
     let (mut notify_stop, work_as_service) = if let Some(notify_stop) = notify_stop {
