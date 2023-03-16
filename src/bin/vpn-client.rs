@@ -214,13 +214,18 @@ async fn do_service(matches: &clap::ArgMatches) -> anyhow::Result<()> {
                         local_ipaddrs.push((ipnet.addr(), metered));
 
                         info!("Connecting to {}", &url);
-                        let conn = quic
+                        let conn = match quic
                             .connect(url.clone(),
                                 Some(SocketAddr::new(ipnet.addr(), 0))
                             )
                             .await
-                            .map_err(|e| anyhow!(e))
-                            .context("connect()")?;
+                        {
+                            Ok(v) => v,
+                            Err(e) => {
+                                error!("failed to connect(): {:?}", e);
+                                continue;
+                            }
+                        };
 
                         let mut notify_shutdown_rx = notify_shutdown_tx.subscribe();
                         let stream = Box::pin(async_stream::stream! {
