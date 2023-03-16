@@ -203,13 +203,15 @@ async fn do_service(matches: &clap::ArgMatches) -> anyhow::Result<()> {
     let mut stream_map = StreamMap::new();
 
     let mut conns = Vec::new();
+    let mut local_ipaddrs = Vec::new();
     loop {
         tokio::select! {
             res = notify_ipchange_rx.recv() => {
                 let event = res.context("recv ipchange event")?;
                 match event {
                     IfEventExt::Up((ipnet, metered)) => {
-                        info!("Local address {}(metered: {}) up", ipnet, metered);
+                        info!("Local address {}(metered: {}) up", ipnet.addr(), metered);
+                        local_ipaddrs.push((ipnet.addr(), metered));
 
                         info!("Connecting to {}", &url);
                         let conn = quic
@@ -292,13 +294,18 @@ async fn do_service(matches: &clap::ArgMatches) -> anyhow::Result<()> {
         .map_err(|e| anyhow!(e))
         .context("path_stats()")?;
 
-    assert_eq!(paths.len(), 1);
-    let first_local_addr = paths[0].local_addr;
-    let peer_addr = paths[0].peer_addr;
-    let local_port = first_local_addr.port();
+    let first_local_addr = paths.first().expect("No path").local_addr;
+    let first_local_port = first_local_addr.port();
+    let peer_addr = paths.first().expect("No path").peer_addr;
 
-    pathmng.register_local_addr(first_local_addr, false);
+    for (local_ipaddr, metered) in local_ipaddrs {
+        pathmng.register_local_addr(
+            SocketAddr::new(local_ipaddr, first_local_port),
+            metered,
+        );
+    }
     pathmng.register_peer_addr(peer_addr);
+    pathmng.probe().await.context("probing new path")?;
 
     pathmng
         .set_group(first_local_addr)
@@ -369,13 +376,13 @@ async fn do_service(matches: &clap::ArgMatches) -> anyhow::Result<()> {
                 let event = res.context("recv ipchange event")?;
                 match event {
                     IfEventExt::Up((ipnet, metered)) => {
-                        info!("Local address {}(metered: {}) up", ipnet, metered);
-                        let new_local_addr = SocketAddr::new(ipnet.addr(), local_port);
+                        info!("Local address {}(metered: {}) up", ipnet.addr(), metered);
+                        let new_local_addr = SocketAddr::new(ipnet.addr(), first_local_port);
                         pathmng.register_local_addr(new_local_addr, metered);
                         pathmng.probe().await.context("probing new path")?;
                     }
                     IfEventExt::Down(ipnet) => {
-                        info!("Local address {} down", ipnet);
+                        info!("Local address {} down", ipnet.addr());
                     }
                 }
             }
