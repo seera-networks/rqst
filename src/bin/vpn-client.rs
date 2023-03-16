@@ -3,10 +3,10 @@ use flexi_logger::{detailed_format, FileSpec, Logger, WriteMode};
 use ipnet::IpNet;
 use log::{error, info};
 use rqst::config::*;
-use rqst::ifwatch::{IfEventExt, IfWatcherExt};
+use rqst::ifwatch::{IfEventExt, IfWatcherExt, IfNameFilter};
 use rqst::quic::*;
 use rqst::vpn::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::io::prelude::*;
 use std::net::SocketAddr;
@@ -602,7 +602,7 @@ async fn start_watch_ipchange(
         .map(|v| v.into())
         .collect::<Vec<IpNet>>();
     include_ipnets.append(&mut include_ipv6nets);
-
+    
     let exclude_metered = client_config.exclude_iftype.iftypes.iter().any(|v| {
         if let IfType::Metered = v {
             true
@@ -618,9 +618,38 @@ async fn start_watch_ipchange(
         }
     });
 
+    let ifname_filter = match &client_config.exclude_ifname {
+        ExcludeIfName::ExcludeIfnames { ifnames } => {
+            if ifnames.is_empty() {
+                None
+            } else {
+                Some(
+                    IfNameFilter::Exclusive {
+                        ifnames: ifnames.iter()
+                            .cloned()
+                            .collect::<HashSet<String>>()
+                    }
+                )
+            }
+        },
+        ExcludeIfName::IncludeIfnames { ifnames } => {
+            if ifnames.is_empty() {
+                None
+            } else {
+                Some(
+                    IfNameFilter::Inclusive {
+                        ifnames: ifnames.iter()
+                            .cloned()
+                            .collect::<HashSet<String>>()
+                    }
+                )
+            }
+        }
+    };
+
     info!(
-        "exclude ipnet: {:?}, include ipnet: {:?}, exclude_metered: {}, exclude_not_metered: {}",
-        exclude_ipnets, include_ipnets, exclude_metered, exclude_not_metered
+        "exclude ipnet: {:?}, include ipnet: {:?}, exclude_metered: {}, exclude_not_metered: {}, ifname_filter: {:?}",
+        exclude_ipnets, include_ipnets, exclude_metered, exclude_not_metered, ifname_filter
     );
 
     let ifwatcher = IfWatcherExt::new(
@@ -628,6 +657,7 @@ async fn start_watch_ipchange(
         include_ipnets,
         exclude_metered,
         exclude_not_metered,
+        ifname_filter,
     )
     .await
     .context("initialize IfWatcherExt")?;

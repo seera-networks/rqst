@@ -8,6 +8,7 @@ mod windows;
 use self::windows::*;
 
 use anyhow::{anyhow, Context};
+use if_addrs::{get_if_addrs};
 use if_watch::{tokio::IfWatcher, IfEvent};
 use ipnet::IpNet;
 use std::collections::{HashSet, HashMap};
@@ -19,12 +20,24 @@ pub enum IfEventExt {
     Down(IpNet),
 }
 
+#[derive(Debug)]
+pub enum IfNameFilter {
+    Exclusive {
+        ifnames: HashSet<String>,
+    },
+
+    Inclusive {
+        ifnames: HashSet<String>,
+    }
+}
+
 pub struct IfWatcherExt {
     inner: IfWatcher,
     exclude_ipnets: Vec<IpNet>,
     include_ipnets: Vec<IpNet>,
     exclude_metered: bool,
     exclude_not_metered: bool,
+    ifname_filter: Option<IfNameFilter>,
     included: HashMap<IpNet, bool>,
     excluded: HashSet<IpNet>,
 }
@@ -35,6 +48,7 @@ impl IfWatcherExt {
         include_ipnets: Vec<IpNet>,
         exclude_metered: bool,
         exclude_not_metered: bool,
+        ifname_filter: Option<IfNameFilter>,
     ) -> anyhow::Result<Self> {
         let ifwatcher = IfWatcher::new().context("initialize IfWatcher")?;
         Ok(IfWatcherExt {
@@ -43,6 +57,7 @@ impl IfWatcherExt {
             include_ipnets,
             exclude_metered,
             exclude_not_metered,
+            ifname_filter,
             included: HashMap::new(),
             excluded: HashSet::new(),
         })
@@ -73,21 +88,47 @@ impl IfWatcherExt {
                         .iter()
                         .find(|include| include.contains(&ipnet.addr()));
 
-                    if excluded.is_none() || included.is_some() {
-                        let metered = is_metered(ipnet.addr()).await.context("is_metered()");
-                        let metered = metered?;
-                        if (metered && !self.exclude_metered)
-                            || (!metered && !self.exclude_not_metered)
-                        {
-                            self.included.insert(ipnet, metered);
-                            return Ok(IfEventExt::Up((ipnet, metered)));
-                        }
+                    if excluded.is_some() && included.is_none() {
+                        self.excluded.insert(ipnet);
+                        continue;
                     }
-                    self.excluded.insert(ipnet);
+
+                    let ifname = get_if_addrs()?
+                        .iter()
+                        .find(|v| {
+                            v.ip() == ipnet.addr()
+                        })
+                        .map(|v| v.name.clone());
+                    let filtered = match (&self.ifname_filter, ifname) {
+                        (Some(IfNameFilter::Exclusive { ifnames }), Some(ifname)) => {
+                            ifnames.contains(&ifname)
+                        },
+                        (Some(IfNameFilter::Inclusive { ifnames }), Some(ifname)) => {
+                            !ifnames.contains(&ifname)
+                        },
+                        _ => false
+                    };
+
+                    if filtered {
+                        self.excluded.insert(ipnet);
+                        continue;
+                    }
+
+                    let metered = is_metered(ipnet.addr()).await.context("is_metered()");
+                    let metered = metered?;
+                    if (metered && !self.exclude_metered)
+                        || (!metered && !self.exclude_not_metered)
+                    {
+                        self.included.insert(ipnet, metered);
+                        return Ok(IfEventExt::Up((ipnet, metered)));
+                    } else {
+                        self.excluded.insert(ipnet);
+                    }
                 }
                 IfEvent::Down(ipnet) => {
                     if self.excluded.contains(&ipnet) {
                         self.excluded.remove(&ipnet);
+                        continue;
                     }
                     if self.included.contains_key(&ipnet) {
                         self.included.remove(&ipnet);

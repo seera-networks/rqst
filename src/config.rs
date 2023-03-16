@@ -64,6 +64,10 @@ fn default_exclude_iftype() -> ExcludeIfType {
     }
 }
 
+fn default_exclude_ifname() -> ExcludeIfName {
+    ExcludeIfName::ExcludeIfnames { ifnames: Vec::new() }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClientConfig {
     #[serde(rename = "path-groups", default)]
@@ -80,6 +84,9 @@ pub struct ClientConfig {
 
     #[serde(rename = "exclude-iftype", default = "default_exclude_iftype")]
     pub exclude_iftype: ExcludeIfType,
+
+    #[serde(rename = "exclude-ifname", default = "default_exclude_ifname")]
+    pub exclude_ifname: ExcludeIfName,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -145,6 +152,21 @@ pub struct ExcludeIfType {
     #[serde(default)]
     pub iftypes: Vec<IfType>,
 }
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", deny_unknown_fields)]
+pub enum ExcludeIfName {
+    #[serde(rename = "exclusive")]
+    ExcludeIfnames {
+        ifnames: Vec<String>,
+    },
+
+    #[serde(rename = "inclusive")]
+    IncludeIfnames {
+        ifnames: Vec<String>,
+    }
+}
+
 mod testing {
     #[test]
     fn client_config() {
@@ -168,6 +190,9 @@ mod testing {
             include-ipnets = ["192.168.1.0/24"]
             [exclude-ipv6net]
             exclude-ipnets = ["::1/128", "fe80::/64"]
+            [exclude-ifname]
+            kind = "inclusive"
+            ifnames = ["{9061C62B-AFA7-4C35-B94D-FF47070DF9A3}", "{0798E57C-C9B4-447C-AE66-9E344D5DF9D6}"]
             [exclude-iftype]
             iftypes = ["metered"]
         "#;
@@ -235,6 +260,16 @@ mod testing {
                     Ipv6Net::from_str("fe80::/64").unwrap(),
                 ],
                 include_ipnets: Vec::new()
+            }
+        );
+
+        assert_eq!(
+            cfg.exclude_ifname,
+            ExcludeIfName::IncludeIfnames {
+                ifnames: vec![
+                    "{9061C62B-AFA7-4C35-B94D-FF47070DF9A3}".to_string(),
+                    "{0798E57C-C9B4-447C-AE66-9E344D5DF9D6}".to_string(),
+                ]
             }
         );
 
