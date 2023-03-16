@@ -4,18 +4,23 @@
 [exclude-ipv4net]
 # loopbackアドレスとprivateアドレスは一旦すべて除外
 #exclude-ipnets = ["127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
-# NAT配下で用いているPrivateアドレスを含める
+# loopbackアドレスのみ除外。後述するexclude-ifnameセクションを"inclusive"モードで記述する場合に便利
+exclude-ipnets = ["127.0.0.0/8"]
+# 必要な場合はNAT配下で用いているPrivateアドレスを含める
 #include-ipnets = ["192.168.1.0/24", "192.168.179.0/24"]
 
 # 使用しないローカルのネットワークのIPv6アドレスを指定
 [exclude-ipv6net]
 # loopbackアドレスとlink localアドレスは除外
-#exclude-ipnets = ["::1/128", "fe80::/64"]
+exclude-ipnets = ["::1/128", "fe80::/64"]
 
 # 列挙されたローカルネットワークのインターフェースに属するアドレス以外は除外する
 [exclude-ifname]
 kind = "inclusive"
+# Windowsの場合、インターフェースの名前はGUIDで指定する。
 ifnames = ["{9061C62B-AFA7-4C35-B94D-FF47070DF9A3}", "{0798E57C-C9B4-447C-AE66-9E344D5DF9D6}"]
+# Linuxの場合
+#ifnames = ["eth0"]
 
 # 列挙されたローカルネットワークのインターフェースに属するアドレスは除外する
 #[exclude-ifname]
