@@ -1,6 +1,5 @@
 extern crate env_logger;
 
-use if_watch::IfWatcher;
 use bytes::BytesMut;
 use rqst::quic::*;
 use std::env;
@@ -63,8 +62,6 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         false,
         shutdown_complete_tx.clone(),
     );
-
-    let mut ifwatcher = IfWatcher::new().await.unwrap();
 
     let mut notify_shutdown_rx: broadcast::Receiver<()> = notify_shutdown.subscribe();
     let shutdown_complete_tx1 = shutdown_complete_tx.clone();
@@ -194,9 +191,6 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                             println!("path_event failed: {:?}", e);
                         }
                     }
-                },
-                event = Pin::new(&mut ifwatcher) => {
-                    println!("Got event {:?}", event);
                 },
                 _ = notify_shutdown_rx.recv() => {
                     break;

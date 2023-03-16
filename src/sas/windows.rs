@@ -522,15 +522,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_sas_ipv4() {
-        use if_watch::IfWatcher;
+        use tokio_stream::StreamExt;
+        use if_watch::tokio::IfWatcher;
         use std::net::IpAddr;
-        use std::pin::Pin;
 
         let sender = bind_sas("0.0.0.0:0").await.unwrap();
         let send_buf = b"hello";
 
-        let mut ifwatcher = IfWatcher::new().await.unwrap();
-        let _ = Pin::new(&mut ifwatcher).await;
+        let mut ifwatcher = IfWatcher::new().unwrap();
+        ifwatcher.next().await;
         for ipnet in ifwatcher.iter() {
             match ipnet.addr() {
                 IpAddr::V4(addr) => {
@@ -552,15 +552,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_sas_ipv6() {
-        use if_watch::IfWatcher;
+        use tokio_stream::StreamExt;
+        use if_watch::tokio::IfWatcher;
         use std::net::IpAddr;
-        use std::pin::Pin;
 
         let sender = bind_sas("[::]:0").await.unwrap();
         let send_buf = b"hello";
 
-        let mut ifwatcher = IfWatcher::new().await.unwrap();
-        let _ = Pin::new(&mut ifwatcher).await;
+        let mut ifwatcher = IfWatcher::new().unwrap();
+        ifwatcher.next().await;
         for ipnet in ifwatcher.iter() {
             match ipnet.addr() {
                 IpAddr::V4(_) => {}

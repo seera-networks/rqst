@@ -7,11 +7,11 @@ mod windows;
 #[cfg(windows)]
 use self::windows::*;
 
-use anyhow::Context;
-use if_watch::{IfEvent, IfWatcher};
+use anyhow::{anyhow, Context};
+use if_watch::{tokio::IfWatcher, IfEvent};
 use ipnet::IpNet;
 use std::collections::HashSet;
-use std::pin::Pin;
+use tokio_stream::StreamExt;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum IfEventExt {
@@ -35,7 +35,7 @@ impl IfWatcherExt {
         exclude_metered: bool,
         exclude_not_metered: bool,
     ) -> anyhow::Result<Self> {
-        let ifwatcher = IfWatcher::new().await.context("initialize IfWatcher")?;
+        let ifwatcher = IfWatcher::new().context("initialize IfWatcher")?;
         Ok(IfWatcherExt {
             inner: ifwatcher,
             exclude_ipnets,
@@ -53,33 +53,34 @@ impl IfWatcherExt {
     // Not cancel-safe
     pub async fn pop(&mut self) -> anyhow::Result<IfEventExt> {
         loop {
-            let event = Pin::new(&mut self.inner)
+            let event = self
+                .inner
+                .next()
                 .await
-                .context("IfWatcher")?;
+                .ok_or(anyhow!("unknown error"))
+                .context("IfWatcher::next()")?
+                .context("IfWatcher::next()")?;
             match event {
                 IfEvent::Up(ipnet) => {
-                    let excluded = self.exclude_ipnets
+                    let excluded = self
+                        .exclude_ipnets
                         .iter()
-                        .find(|exclude| {
-                            exclude.contains(&ipnet.addr())
-                        });
-                    let included = self.include_ipnets
+                        .find(|exclude| exclude.contains(&ipnet.addr()));
+                    let included = self
+                        .include_ipnets
                         .iter()
-                        .find(|include| {
-                            include.contains(&ipnet.addr())
-                        });
+                        .find(|include| include.contains(&ipnet.addr()));
 
                     if excluded.is_none() || included.is_some() {
-                        let metered = is_metered(ipnet.addr())
-                            .await
-                            .context("is_metered()");
+                        let metered = is_metered(ipnet.addr()).await.context("is_metered()");
                         let metered = metered?;
-                        if (metered && !self.exclude_metered) ||
-                            (!metered && !self.exclude_not_metered) {
+                        if (metered && !self.exclude_metered)
+                            || (!metered && !self.exclude_not_metered)
+                        {
                             return Ok(IfEventExt::Up((ipnet, metered)));
                         }
                     }
-                    self.excluded.insert(ipnet); 
+                    self.excluded.insert(ipnet);
                 }
                 IfEvent::Down(ipnet) => {
                     if self.excluded.contains(&ipnet) {

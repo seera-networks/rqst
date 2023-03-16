@@ -3,7 +3,6 @@ extern crate env_logger;
 use anyhow::{anyhow, Context};
 use bytes::{BytesMut, BufMut};
 use log::{info, error};
-use if_watch::IfWatcher;
 use rqst::{quic::*, vpn::*};
 use std::env;
 use std::time::{Duration, Instant};
@@ -66,8 +65,6 @@ async fn main() -> anyhow::Result<()> {
         false,
         shutdown_complete_tx,
     );
-
-    let mut ifwatcher = IfWatcher::new().await.unwrap();
 
     info!("Connecting to {}", &url);
     let conn = quic.connect(url, None).await.map_err(|e| anyhow!(e)).context("connect()")?;
@@ -226,9 +223,6 @@ async fn main() -> anyhow::Result<()> {
 
                     quiche::PathEvent::RemoveGroup(..) => unreachable!(),
                 }
-            },
-            event = Pin::new(&mut ifwatcher) => {
-                println!("Got event {:?}", event);
             },
             _ = tokio::signal::ctrl_c() => {
                 info!("Ctrl-C signaled");
