@@ -90,8 +90,8 @@ async fn main() -> anyhow::Result<()> {
 
         local_addr.set_port(local_addr.port() + 1);
         match conn.probe_path(local_addr, peer_addr).await {
-            Ok((_, seq)) => {
-                info!("probe_path: dcid seq={}", seq);
+            Ok(_) => {
+                info!("Request probing ({} {})", local_addr, peer_addr);
             }
             Err(e) => {
                 info!("failed to probe_path: {:?}", e);

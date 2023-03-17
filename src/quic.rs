@@ -123,7 +123,7 @@ enum ActorMessage {
         conn_handle: ConnectionHandle,
         local_addr: SocketAddr,
         peer_addr: SocketAddr,
-        respond_to: oneshot::Sender<Result<(SocketAddr, u64)>>,
+        respond_to: oneshot::Sender<Result<SocketAddr>>,
     },
     PathEventReadness {
         conn_handle: ConnectionHandle,
@@ -198,7 +198,6 @@ struct SendStreamRequest {
 struct ProbePathRequest {
     local_addr: SocketAddr,
     peer_addr: SocketAddr,
-    respond_to: oneshot::Sender<Result<(SocketAddr, u64)>>,
 }
 
 struct PathEventReadnessRequest {
@@ -791,25 +790,28 @@ impl QuicActor {
                 };
                 let socket = self.sockets.get(&socket_handle).unwrap().clone();
 
+
                 if let Some(conn) = self.conns.get_mut(&conn_handle) {
                     conn.locals_to_sockets.insert(local_addr, socket);
 
-                    if conn.quiche_conn.available_dcids() > 0 {
-                        match conn.quiche_conn.probe_path(local_addr, peer_addr) {
-                            Ok(v) => {
-                                let _ = respond_to.send(Ok((local_addr, v)));
-                            }
-                            Err(e) => {
-                                let _ = respond_to
-                                    .send(Err(format!("probe_path failed: {:?}", e).into()));
+                    let _ = respond_to.send(Ok(local_addr));
+
+                    match conn.quiche_conn.probe_path(local_addr, peer_addr) {
+                        Ok(_v) => {}
+                        Err(quiche::Error::OutOfIdentifiers) => {
+                            if conn.quiche_conn.available_dcids() > 0 && conn.quiche_conn.source_cids_left() == 0 {
+                                error!("cannot probe ({} {}): out of SCID", local_addr, peer_addr);
+                            } else {
+                                info!("wait probing ({} {}) until SCID or DCID available", local_addr, peer_addr);
+                                conn.probe_path_requests.push_back(ProbePathRequest {
+                                    local_addr,
+                                    peer_addr,
+                                });
                             }
                         }
-                    } else {
-                        conn.probe_path_requests.push_back(ProbePathRequest {
-                            local_addr,
-                            peer_addr,
-                            respond_to,
-                        });
+                        Err(e) => {
+                            error!("cannot probe ({} {}): {:?}", local_addr, peer_addr, e);
+                        }
                     }
                 } else {
                     let _ =
@@ -1195,14 +1197,19 @@ impl QuicActor {
                                 .probe_path(request.local_addr, request.peer_addr)
                             {
                                 Ok(seq) => {
-                                    let _ = request.respond_to.send(Ok((request.local_addr, seq)));
+                                    info!("Probe ({} {}) with seq={}", request.local_addr, request.peer_addr, seq);
+                                }
+                                Err(quiche::Error::OutOfIdentifiers) => {
+                                    if conn.quiche_conn.available_dcids() > 0 && conn.quiche_conn.source_cids_left() == 0 {
+                                        error!("cannot probe ({} {}): out of SCID", request.local_addr, request.peer_addr);
+                                    } else {
+                                        info!("wait again probing ({} {}) until SCID or DCID available", request.local_addr, request.peer_addr);
+                                        conn.probe_path_requests.push_front(request);
+                                        break;
+                                    }
                                 }
                                 Err(e) => {
-                                    let _ = request.respond_to.send(Err(format!(
-                                        "probe_path() failed: {:?}",
-                                        e
-                                    )
-                                    .into()));
+                                    error!("cannot probe ({} {}): {:?}", request.local_addr, request.peer_addr, e);
                                 }
                             }
                         }
@@ -1281,9 +1288,6 @@ impl Drop for QuicConnection {
             let _ = request.respond_to.send(Err("Connection closed".into()));
         }
         for request in self.send_dgram_requests.drain(..) {
-            let _ = request.respond_to.send(Err("Connection closed".into()));
-        }
-        for request in self.probe_path_requests.drain(..) {
             let _ = request.respond_to.send(Err("Connection closed".into()));
         }
         for request in self.path_event_readness_requests.drain(..) {
@@ -1570,7 +1574,7 @@ impl QuicConnectionHandle {
         recv.await.expect("Actor task has been killed")
     }
 
-    pub async fn probe_path(&self, local_addr: SocketAddr, peer_addr: SocketAddr) -> Result<(SocketAddr, u64)> {
+    pub async fn probe_path(&self, local_addr: SocketAddr, peer_addr: SocketAddr) -> Result<SocketAddr> {
         let (send, recv) = oneshot::channel();
         let msg = ActorMessage::ProbePath {
             conn_handle: self.conn_handle,

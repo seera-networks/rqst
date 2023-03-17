@@ -323,13 +323,13 @@ impl PathManager {
 
         let mut count: usize = 0;
         for (local_addr, peer_addr) in paths.difference(&paths1) {
-            let (_, seq) = self
+            let local_addr = self
                 .conn
                 .probe_path(*local_addr, *peer_addr)
                 .await
                 .map_err(|e| anyhow!(e))
                 .context("probe_path()")?;
-            info!("Probing ({}, {}) with seq={}", local_addr, peer_addr, seq);
+            info!("Request probing ({}, {})", local_addr, peer_addr);
             count = count.saturating_add(1);
         }
         Ok(count)
