@@ -309,6 +309,7 @@ async fn tokio_main(
     config.set_initial_max_stream_data_uni(1_000_000);
     config.set_initial_max_streams_bidi(100);
     config.set_initial_max_streams_uni(100);
+    config.set_active_connection_id_limit(12);
     config.set_disable_active_migration(true);
     config.enable_early_data();
     config.enable_dgram(true, 1000, 1000);
