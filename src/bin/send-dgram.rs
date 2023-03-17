@@ -98,7 +98,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
             local_addr.set_port(local_addr.port() + 1);
             match conn.probe_path(local_addr, peer_addr).await {
-                Ok((_)) => {
+                Ok(_) => {
                     println!("Request probing ({} {})", local_addr, peer_addr);
                 }
                 Err(e) => {
