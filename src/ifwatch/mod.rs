@@ -106,7 +106,13 @@ impl IfWatcherExt {
                         (Some(IfNameFilter::Inclusive { ifnames }), Some(ifname)) => {
                             !ifnames.contains(&ifname)
                         },
-                        _ => false
+                        (None, Some(_)) => {
+                            false
+                        },
+                        (_, None) => {
+                            // IpAddr of Down I/F
+                            true
+                        },
                     };
 
                     if filtered {
